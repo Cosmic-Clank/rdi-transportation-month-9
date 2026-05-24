@@ -18,7 +18,7 @@ dist/
 htmlcov/
 .ipynb_checkpoints/
 
-gtsrb/
+dataset
 *.pth
 # IDE / editor
 .vscode/
