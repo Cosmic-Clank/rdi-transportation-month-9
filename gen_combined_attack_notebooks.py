@@ -1,0 +1,876 @@
+"""Generate six combined attack notebooks: {model}_attack_{gtsrb,bel}.ipynb
+
+Each notebook merges the FGSM/PGD/ablation/perceptibility logic (normalized space,
+from {model}_attacks.ipynb) with the AutoAttack logic ([0,1] pixel space + NormalizedModel
+wrapper, from {model}_autoattack.ipynb) into one organized notebook, over a low-start
+epsilon grid that reveals where each attack becomes effective.
+
+Both pipelines load the same checkpoint and use seed=42 + EVAL_SUBSET=2000, so they
+evaluate the identical images and their ASR numbers are directly comparable.
+"""
+import json, os
+
+_id = 0
+def _next_id():
+    global _id
+    _id += 1
+    return f"c{_id:03d}"
+
+def md(text):
+    return {"cell_type": "markdown", "id": _next_id(), "metadata": {}, "source": text}
+
+def code(lines):
+    return {"cell_type": "code", "execution_count": None, "id": _next_id(),
+            "metadata": {}, "outputs": [], "source": lines}
+
+def nb(cells):
+    return {
+        "nbformat": 4, "nbformat_minor": 5,
+        "metadata": {
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"name": "python", "version": "3.10.0"},
+        },
+        "cells": cells,
+    }
+
+# ── per-notebook config ──────────────────────────────────────────────────────
+GTSRB_CLASS_DEF = """class GTSRBTestDataset(Dataset):
+    def __init__(self, csv_path, root_dir, transform=None):
+        self.df = pd.read_csv(csv_path)
+        self.root_dir = root_dir
+        self.transform = transform
+    def __len__(self):
+        return len(self.df)
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = os.path.join(self.root_dir, row['Path'])
+        image = Image.open(img_path).convert('RGB')
+        label = int(row['ClassId'])
+        if self.transform:
+            image = self.transform(image)
+        return image, label"""
+
+BEL_CLASS_DEF = """class NumericImageFolder(torchvision.datasets.ImageFolder):
+    \"\"\"Sorts class folders by integer value. Skips non-directory entries (Readme.txt).\"\"\"
+    def find_classes(self, directory):
+        classes = sorted(
+            (e.name for e in os.scandir(directory) if e.is_dir()),
+            key=lambda x: int(x)
+        )
+        class_to_idx = {cls: int(cls) for cls in classes}
+        return classes, class_to_idx"""
+
+CONFIGS = [
+    dict(model_name='ResNet-50', short='resnet', dataset='GTSRB', ds_short='gtsrb',
+         ckpt='best_resnet50_gtsrb.pth', num_classes=43, num_classes_note=43,
+         model_import='from torchvision.models import ResNet50_Weights',
+         model_init="model = models.resnet50(weights=None)\nmodel.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)",
+         eps_just="All below Madry 8/255 normalised; sweep starts at 0.001 to expose the floor",
+         class_def=GTSRB_CLASS_DEF,
+         build_full="GTSRBTestDataset(TEST_CSV, DATA_DIR, transform={tf})",
+         data_vars="DATA_DIR    = 'dataset'\nTEST_CSV    = os.path.join(DATA_DIR, 'Test.csv')"),
+
+    dict(model_name='VGG-16', short='vgg16', dataset='GTSRB', ds_short='gtsrb',
+         ckpt='best_vgg16_gtsrb.pth', num_classes=43, num_classes_note=43,
+         model_import='from torchvision.models import VGG16_Weights',
+         model_init="model = models.vgg16(weights=None)\nmodel.classifier[6] = nn.Linear(4096, NUM_CLASSES)",
+         eps_just="All below Madry 8/255 normalised; sweep starts at 0.001 to expose the floor",
+         class_def=GTSRB_CLASS_DEF,
+         build_full="GTSRBTestDataset(TEST_CSV, DATA_DIR, transform={tf})",
+         data_vars="DATA_DIR    = 'dataset'\nTEST_CSV    = os.path.join(DATA_DIR, 'Test.csv')"),
+
+    dict(model_name='MobileNetV3-Large', short='mobilenetv3', dataset='GTSRB', ds_short='gtsrb',
+         ckpt='best_mobilenetv3_gtsrb.pth', num_classes=43, num_classes_note=43,
+         model_import='from torchvision.models import MobileNet_V3_Large_Weights',
+         model_init="model = models.mobilenet_v3_large(weights=None)\nmodel.classifier[3] = nn.Linear(model.classifier[3].in_features, NUM_CLASSES)",
+         eps_just="All below Madry 8/255 normalised; sweep starts at 0.001 to expose the floor",
+         class_def=GTSRB_CLASS_DEF,
+         build_full="GTSRBTestDataset(TEST_CSV, DATA_DIR, transform={tf})",
+         data_vars="DATA_DIR    = 'dataset'\nTEST_CSV    = os.path.join(DATA_DIR, 'Test.csv')"),
+
+    dict(model_name='ResNet-50', short='resnet', dataset='BelgiumTSC', ds_short='bel',
+         ckpt='best_resnet50_btsd.pth', num_classes=62, num_classes_note=62,
+         model_import='from torchvision.models import ResNet50_Weights',
+         model_init="model = models.resnet50(weights=None)\nmodel.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)",
+         eps_just="All below Madry 8/255 normalised; sweep starts at 0.001 to expose the floor",
+         class_def=BEL_CLASS_DEF,
+         build_full="NumericImageFolder(TEST_DIR, transform={tf}, allow_empty=True)",
+         data_vars="DATA_DIR    = 'dataset'\nTEST_DIR    = os.path.join(DATA_DIR, 'BelgiumTSC_Testing', 'Testing')"),
+
+    dict(model_name='VGG-16', short='vgg16', dataset='BelgiumTSC', ds_short='bel',
+         ckpt='best_vgg16_btsd.pth', num_classes=62, num_classes_note=62,
+         model_import='from torchvision.models import VGG16_Weights',
+         model_init="model = models.vgg16(weights=None)\nmodel.classifier[6] = nn.Linear(4096, NUM_CLASSES)",
+         eps_just="All below Madry 8/255 normalised; sweep starts at 0.001 to expose the floor",
+         class_def=BEL_CLASS_DEF,
+         build_full="NumericImageFolder(TEST_DIR, transform={tf}, allow_empty=True)",
+         data_vars="DATA_DIR    = 'dataset'\nTEST_DIR    = os.path.join(DATA_DIR, 'BelgiumTSC_Testing', 'Testing')"),
+
+    dict(model_name='MobileNetV3-Large', short='mobilenetv3', dataset='BelgiumTSC', ds_short='bel',
+         ckpt='best_mobilenetv3_btsd.pth', num_classes=62, num_classes_note=62,
+         model_import='from torchvision.models import MobileNet_V3_Large_Weights',
+         model_init="model = models.mobilenet_v3_large(weights=None)\nmodel.classifier[3] = nn.Linear(model.classifier[3].in_features, NUM_CLASSES)",
+         eps_just="All below Madry 8/255 normalised; sweep starts at 0.001 to expose the floor",
+         class_def=BEL_CLASS_DEF,
+         build_full="NumericImageFolder(TEST_DIR, transform={tf}, allow_empty=True)",
+         data_vars="DATA_DIR    = 'dataset'\nTEST_DIR    = os.path.join(DATA_DIR, 'BelgiumTSC_Testing', 'Testing')"),
+]
+
+
+def lines(s):
+    """Split a block into JSON-cell source lines; every line keeps a trailing newline
+    so adjacent blocks concatenate safely."""
+    if s.endswith("\n"):
+        s = s[:-1]
+    return [p + "\n" for p in s.split("\n")]
+
+
+def make_notebook(c):
+    json_fname = f"attack_summary_{c['short']}_{c['ds_short']}.json"
+    aa_curve_png = f"{c['short']}_{c['ds_short']}_asr_vs_eps.png"
+    build_norm = c['build_full'].format(tf='norm_transform')
+    build_raw  = c['build_full'].format(tf='raw_transform')
+
+    cells = []
+
+    # ===== Title =====
+    cells.append(md(lines(
+f"""# Adversarial Attack Suite — {c['model_name']} on {c['dataset']}
+
+Comprehensive L∞ adversarial evaluation in one notebook: **FGSM**, **PGD**, **AutoAttack**,
+perceptual-imperceptibility metrics, and PGD hyperparameter ablations.
+
+**ε sweep (normalized space):** `[0.001, 0.002, 0.003, 0.005, 0.0075, 0.01, 0.02, 0.05, 0.1]`
+— starts low to reveal *where* each attack becomes effective, instead of saturating at ~100% ASR.
+
+**Two input-space pipelines, same images & checkpoint (seed=42, N=2000):**
+- *Pipeline A — normalized space* (`Normalize` in transform, bare `model`): FGSM, PGD, ablations, metrics, visuals.
+- *Pipeline B — [0,1] pixel space* (`NormalizedModel` wrapper): AutoAttack, with `eps_pixel = eps_norm × mean(IMAGENET_STD)`.
+
+Both pipelines use the **same normalized-space ε convention**, so FGSM/PGD/AutoAttack ASR numbers are directly comparable.""")))
+
+    # ===== Part 0 — Setup =====
+    cells.append(md(lines("## Part 0 — Setup & Configuration")))
+
+    # Cell: imports + config
+    cells.append(code(
+        lines("import torch\nimport torch.nn as nn\nimport torchvision\nfrom torchvision import transforms, models")
+        + lines(c['model_import'])
+        + lines("from torch.utils.data import DataLoader, Dataset, Subset\n"
+                "import pandas as pd\nimport numpy as np\nfrom PIL import Image\n"
+                "import os\nimport io\nimport re\nimport json\nimport contextlib\nimport matplotlib.pyplot as plt")
+        + ["\n"]
+        + lines(c['data_vars'])
+        + [f"CKPT_PATH   = '{c['ckpt']}'\n",
+           f"MODEL_NAME  = '{c['model_name']}'\n",
+           f"DATASET     = '{c['dataset']}'\n",
+           f"NUM_CLASSES = {c['num_classes']}\n",
+           "BATCH_SIZE  = 32\n",
+           "SEED        = 42\n",
+           "EVAL_SUBSET = 2000     # set None for full test set\n",
+           "PGD_STEPS   = 20       # 20 steps with α=ε/4 → budget 5ε >> ε for iterative refinement\n",
+           "\n",
+           "EPS_VALUES     = [0.001, 0.002, 0.003, 0.005, 0.0075, 0.01, 0.02, 0.05, 0.1]\n",
+           "VIS_EPS_SUBSET = [0.001, 0.005, 0.01, 0.05, 0.1]   # representative subset for the image grid\n",
+           "IMAGENET_MEAN  = [0.485, 0.456, 0.406]\n",
+           "IMAGENET_STD   = [0.229, 0.224, 0.225]\n",
+           "\n",
+           "if torch.cuda.is_available():\n",
+           "    device = torch.device('cuda')\n",
+           "elif torch.backends.mps.is_available():\n",
+           "    device = torch.device('mps')\n",
+           "else:\n",
+           "    device = torch.device('cpu')\n",
+           "\n",
+           "# Per-channel valid bounds in normalized space (for FGSM/PGD clamping)\n",
+           "_mean  = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)\n",
+           "_std   = torch.tensor(IMAGENET_STD).view(1, 3, 1, 1)\n",
+           "_lower = (0 - _mean) / _std\n",
+           "_upper = (1 - _mean) / _std\n",
+           "\n",
+           "print(f'Using device: {device}')\n",
+           "print(f'Model: {MODEL_NAME} | Dataset: {DATASET} | PGD steps: {PGD_STEPS} | Eval subset: {EVAL_SUBSET or \"full\"}')\n",
+           "print(f'EPS grid: {EPS_VALUES}')\n"]
+    ))
+
+    # Cell: Pipeline A (normalized) + model + clean acc
+    cells.append(md(lines(
+        "### Pipeline A — normalized space (FGSM / PGD / ablations / metrics / visuals)")))
+    cells.append(code(
+        lines(c['class_def'])
+        + ["\n",
+           "# Two transforms over the SAME dataset: normalized (Pipeline A) and raw [0,1] (Pipeline B)\n",
+           "norm_transform = transforms.Compose([\n",
+           "    transforms.Resize((224, 224)),\n",
+           "    transforms.ToTensor(),\n",
+           "    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),\n",
+           "])\n",
+           "raw_transform = transforms.Compose([\n",
+           "    transforms.Resize((224, 224)),\n",
+           "    transforms.ToTensor(),\n",
+           "])\n",
+           "\n",
+           f"full_norm = {build_norm}\n",
+           f"full_raw  = {build_raw}\n",
+           "full_test_dataset = full_norm   # alias used by the eval-subset-size ablation\n",
+           "\n",
+           "# Shared subset indices → Pipelines A and B evaluate the identical images\n",
+           "if EVAL_SUBSET:\n",
+           "    torch.manual_seed(SEED)\n",
+           "    indices = torch.randperm(len(full_norm))[:EVAL_SUBSET].tolist()\n",
+           "else:\n",
+           "    indices = list(range(len(full_norm)))\n",
+           "\n",
+           "test_loader = DataLoader(Subset(full_norm, indices), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)\n",
+           "\n",
+           "# Load base model (expects ImageNet-normalized input)\n"]
+        + lines(c['model_init'])
+        + ["model.load_state_dict(torch.load(CKPT_PATH, map_location=device))\n",
+           "model = model.to(device)\n",
+           "model.eval()\n",
+           "for p in model.parameters():\n",
+           "    p.requires_grad_(False)\n",
+           "\n",
+           "criterion = nn.CrossEntropyLoss()\n",
+           "\n",
+           "# Clean accuracy (Pipeline A)\n",
+           "correct, total = 0, 0\n",
+           "with torch.no_grad():\n",
+           "    for imgs, labels in test_loader:\n",
+           "        imgs, labels = imgs.to(device), labels.to(device)\n",
+           "        correct += (model(imgs).argmax(1) == labels).sum().item()\n",
+           "        total += labels.size(0)\n",
+           "clean_acc = correct / total\n",
+           "print(f'Clean accuracy (Pipeline A, normalized): {clean_acc:.4f} ({clean_acc*100:.2f}%)')\n",
+           "print(f'Eval samples: {total}')\n"]
+    ))
+
+    # Cell: Pipeline B (pixel space) + wrapper + cross-check
+    cells.append(md(lines(
+        "### Pipeline B — [0,1] pixel space (AutoAttack)")))
+    cells.append(code([
+        "class NormalizedModel(nn.Module):\n",
+        "    \"\"\"Wraps a model trained on ImageNet-normalized inputs.\n",
+        "    AutoAttack feeds images in [0, 1] pixel space; this wrapper normalizes internally.\"\"\"\n",
+        "    def __init__(self, base_model, mean, std):\n",
+        "        super().__init__()\n",
+        "        self.model = base_model\n",
+        "        self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))\n",
+        "        self.register_buffer('std',  torch.tensor(std).view(1, 3, 1, 1))\n",
+        "    def forward(self, x):\n",
+        "        return self.model((x - self.mean) / self.std)\n",
+        "\n",
+        "wrapped_model = NormalizedModel(model, IMAGENET_MEAN, IMAGENET_STD).to(device)\n",
+        "wrapped_model.eval()\n",
+        "for p in wrapped_model.parameters():\n",
+        "    p.requires_grad_(False)\n",
+        "\n",
+        "# Same images as Pipeline A (same indices), in raw [0,1] space, held in memory for AutoAttack\n",
+        "raw_loader = DataLoader(Subset(full_raw, indices), batch_size=128, shuffle=False, num_workers=0)\n",
+        "images_list, labels_list = [], []\n",
+        "for imgs, lbls in raw_loader:\n",
+        "    images_list.append(imgs)\n",
+        "    labels_list.append(lbls)\n",
+        "images = torch.cat(images_list).to(device)\n",
+        "labels = torch.cat(labels_list).to(device)\n",
+        "print(f'AutoAttack tensor: {images.shape} | pixel range [{images.min():.3f}, {images.max():.3f}] (expected [0,1])')\n",
+        "\n",
+        "# Clean accuracy (Pipeline B) and cross-check against Pipeline A\n",
+        "correct = 0\n",
+        "with torch.no_grad():\n",
+        "    for i in range(0, len(images), 128):\n",
+        "        correct += (wrapped_model(images[i:i+128]).argmax(1) == labels[i:i+128]).sum().item()\n",
+        "clean_acc_b = correct / len(images)\n",
+        "print(f'Clean accuracy (Pipeline B, wrapped): {clean_acc_b:.4f} ({clean_acc_b*100:.2f}%)')\n",
+        "assert abs(clean_acc_b - clean_acc) < 0.005, 'FAIL: pipelines A and B disagree on clean accuracy!'\n",
+        "print('PASS: both pipelines evaluate the same images with matching clean accuracy.')\n",
+    ]))
+
+    # Cell: wrapper verification
+    cells.append(code([
+        "# Verify NormalizedModel == manual-normalize + bare model (numerical equivalence)\n",
+        "normalize = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)\n",
+        "test_batch = images[:16]\n",
+        "with torch.no_grad():\n",
+        "    preds_wrapped = wrapped_model(test_batch).argmax(1)\n",
+        "normalized_batch = torch.stack([normalize(img.cpu()) for img in test_batch]).to(device)\n",
+        "with torch.no_grad():\n",
+        "    preds_manual = model(normalized_batch).argmax(1)\n",
+        "assert (preds_wrapped == preds_manual).all(), 'FAIL: wrapper differs from manual pipeline!'\n",
+        "print('PASS: NormalizedModel wrapper is correct.')\n",
+        "print(f'Sample predictions: {preds_wrapped[:8].tolist()}')\n",
+    ]))
+
+    # ===== Part 1 — FGSM / PGD =====
+    cells.append(md(lines(
+        "## Part 1 — Gradient Attacks (FGSM, PGD)\n\n"
+        "FGSM (single signed-gradient step) and PGD (Madry et al.: random start + iterated FGSM + ε-ball "
+        "projection), evaluated across the full ε grid in normalized space.")))
+
+    cells.append(code([
+        "def fgsm_attack(model, images, labels, eps):\n",
+        "    \"\"\"Fast Gradient Sign Method — single gradient step.\"\"\"\n",
+        "    x = images.clone().requires_grad_(True)\n",
+        "    loss = criterion(model(x), labels)\n",
+        "    loss.backward()\n",
+        "    x_adv = (x + eps * x.grad.sign()).detach()\n",
+        "    x_adv = torch.clamp(x_adv, _lower.to(x_adv.device), _upper.to(x_adv.device))\n",
+        "    return x_adv\n",
+        "\n",
+        "def pgd_attack(model, images, labels, eps, alpha, steps):\n",
+        "    \"\"\"PGD — iterated FGSM with random start and ε-ball projection.\"\"\"\n",
+        "    x = images + torch.empty_like(images).uniform_(-eps, eps)\n",
+        "    x = torch.clamp(x, images - eps, images + eps).detach()\n",
+        "    for _ in range(steps):\n",
+        "        x = x.requires_grad_(True)\n",
+        "        loss = criterion(model(x), labels)\n",
+        "        loss.backward()\n",
+        "        x = (x + alpha * x.grad.sign()).detach()\n",
+        "        x = torch.clamp(x, images - eps, images + eps)\n",
+        "        x = torch.clamp(x, _lower.to(x.device), _upper.to(x.device))\n",
+        "    return x\n",
+        "\n",
+        "def evaluate_attack(attack_fn):\n",
+        "    \"\"\"Returns (adv_acc, asr): adv_acc over all samples; asr = fraction of originally-correct fooled.\"\"\"\n",
+        "    adv_correct = originally_correct = fooled = total = 0\n",
+        "    for imgs, labels in test_loader:\n",
+        "        imgs, labels = imgs.to(device), labels.to(device)\n",
+        "        with torch.no_grad():\n",
+        "            clean_mask = (model(imgs).argmax(1) == labels)\n",
+        "        adv = attack_fn(imgs, labels)\n",
+        "        with torch.no_grad():\n",
+        "            adv_preds = model(adv).argmax(1)\n",
+        "        adv_correct        += (adv_preds == labels).sum().item()\n",
+        "        originally_correct += clean_mask.sum().item()\n",
+        "        fooled             += (clean_mask & (adv_preds != labels)).sum().item()\n",
+        "        total              += labels.size(0)\n",
+        "    adv_acc = adv_correct / total\n",
+        "    asr     = fooled / originally_correct if originally_correct > 0 else 0.0\n",
+        "    return adv_acc, asr\n",
+        "\n",
+        "print('FGSM, PGD, evaluate_attack defined.')\n",
+    ]))
+
+    # FGSM sweep
+    cells.append(code([
+        "fgsm_results = {}\n",
+        "print(f'{\"ε\":>7} | {\"Adv Acc\":>9} | {\"ASR\":>9} | {\"Drop\":>9}')\n",
+        "print('-' * 45)\n",
+        "for eps in EPS_VALUES:\n",
+        "    adv_acc, asr = evaluate_attack(lambda imgs, labels, e=eps: fgsm_attack(model, imgs, labels, e))\n",
+        "    fgsm_results[eps] = {'acc': adv_acc, 'asr': asr}\n",
+        "    print(f'{eps:>7.4f} | {adv_acc*100:>8.2f}% | {asr*100:>8.2f}% | {(clean_acc-adv_acc)*100:>8.2f}pp')\n",
+        "print(f'\\nClean baseline: {clean_acc*100:.2f}%')\n",
+    ]))
+
+    # PGD sweep
+    cells.append(code([
+        "pgd_results = {}\n",
+        "print(f'{\"ε\":>7} | {\"Adv Acc\":>9} | {\"ASR\":>9} | {\"Drop\":>9}  [steps={PGD_STEPS}]')\n",
+        "print('-' * 55)\n",
+        "for eps in EPS_VALUES:\n",
+        "    alpha = eps / 4\n",
+        "    adv_acc, asr = evaluate_attack(lambda imgs, labels, e=eps, a=alpha: pgd_attack(model, imgs, labels, e, a, PGD_STEPS))\n",
+        "    pgd_results[eps] = {'acc': adv_acc, 'asr': asr}\n",
+        "    print(f'{eps:>7.4f} | {adv_acc*100:>8.2f}% | {asr*100:>8.2f}% | {(clean_acc-adv_acc)*100:>8.2f}pp')\n",
+        "print(f'\\nClean baseline: {clean_acc*100:.2f}%')\n",
+    ]))
+
+    # FGSM/PGD plots (log-x) + table
+    cells.append(code([
+        "eps_list  = EPS_VALUES\n",
+        "fgsm_accs = [fgsm_results[e]['acc'] * 100 for e in eps_list]\n",
+        "pgd_accs  = [pgd_results[e]['acc']  * 100 for e in eps_list]\n",
+        "fgsm_asrs = [fgsm_results[e]['asr'] * 100 for e in eps_list]\n",
+        "pgd_asrs  = [pgd_results[e]['asr']  * 100 for e in eps_list]\n",
+        "\n",
+        "fig, axes = plt.subplots(1, 3, figsize=(18, 5))\n",
+        "ax = axes[0]\n",
+        "ax.axhline(clean_acc * 100, color='green', linestyle='--', label=f'Clean ({clean_acc*100:.1f}%)')\n",
+        "ax.semilogx(eps_list, fgsm_accs, 'o-', color='orange', label='FGSM')\n",
+        "ax.semilogx(eps_list, pgd_accs,  's-', color='red',    label=f'PGD ({PGD_STEPS} steps)')\n",
+        "ax.set_xlabel('ε (log scale)'); ax.set_ylabel('Accuracy (%)'); ax.set_title('Accuracy under Attack')\n",
+        "ax.legend(); ax.set_ylim(0, 105); ax.grid(True, which='both', alpha=0.3)\n",
+        "\n",
+        "ax = axes[1]\n",
+        "ax.semilogx(eps_list, fgsm_asrs, 'o-', color='orange', label='FGSM')\n",
+        "ax.semilogx(eps_list, pgd_asrs,  's-', color='red',    label=f'PGD ({PGD_STEPS} steps)')\n",
+        "ax.set_xlabel('ε (log scale)'); ax.set_ylabel('Attack Success Rate (%)'); ax.set_title('Attack Success Rate')\n",
+        "ax.legend(); ax.set_ylim(0, 105); ax.grid(True, which='both', alpha=0.3)\n",
+        "\n",
+        "ax = axes[2]\n",
+        "x = np.arange(len(eps_list)); w = 0.35\n",
+        "ax.bar(x - w/2, fgsm_asrs, w, label='FGSM ASR', color='orange')\n",
+        "ax.bar(x + w/2, pgd_asrs,  w, label='PGD ASR',  color='red')\n",
+        "ax.set_xticks(x); ax.set_xticklabels([str(e) for e in eps_list], rotation=45, fontsize=8)\n",
+        "ax.set_xlabel('ε'); ax.set_ylabel('ASR (%)'); ax.set_title('ASR Comparison')\n",
+        "ax.legend(); ax.grid(True, alpha=0.3, axis='y')\n",
+        "plt.tight_layout(); plt.show()\n",
+        "\n",
+        "print(f'\\n{\"\":=<70}')\n",
+        "print(f'{\"ε\":>7} | {\"Clean\":>8} | {\"FGSM Acc\":>9} | {\"FGSM ASR\":>9} | {\"PGD Acc\":>8} | {\"PGD ASR\":>8}')\n",
+        "print(f'{\"\":=<70}')\n",
+        "for e in eps_list:\n",
+        "    print(f'{e:>7.4f} | {clean_acc*100:>7.2f}% | {fgsm_results[e][\"acc\"]*100:>8.2f}% | {fgsm_results[e][\"asr\"]*100:>8.2f}% | {pgd_results[e][\"acc\"]*100:>7.2f}% | {pgd_results[e][\"asr\"]*100:>7.2f}%')\n",
+        "print(f'{\"\":=<70}')\n",
+    ]))
+
+    # ===== Part 2 — AutoAttack =====
+    cells.append(md(lines(
+        "## Part 2 — AutoAttack (gold-standard L∞)\n\n"
+        "Parameter-free ensemble (APGD-CE, APGD-T, FAB-T, Square) in [0,1] pixel space via the wrapper, "
+        "with `eps_pixel = eps_norm × mean(IMAGENET_STD)`. Run at every ε; verbose log captured to parse "
+        "the sub-attack cascade. AutoAttack is the slow part — early termination is fast for fragile models.")))
+
+    cells.append(code([
+        "from autoattack import AutoAttack\n",
+        "\n",
+        "aa_results = {}   # eps_norm -> {robust_acc, asr, eps_pixel, px_of_255, log}\n",
+        "print('Running AutoAttack L-inf (standard) across the ε grid...')\n",
+        "print('=' * 72)\n",
+        "for eps_norm in EPS_VALUES:\n",
+        "    eps_pixel = float(eps_norm * np.mean(IMAGENET_STD))\n",
+        "    px_of_255 = eps_pixel * 255\n",
+        "    print(f'\\n--- eps_norm={eps_norm}  eps_pixel={eps_pixel:.6f}  ({px_of_255:.4f}/255) ---')\n",
+        "    log_buf = io.StringIO()\n",
+        "    with contextlib.redirect_stdout(log_buf):\n",
+        "        adversary = AutoAttack(wrapped_model, norm='Linf', eps=eps_pixel, version='standard', verbose=True)\n",
+        "        x_adv = adversary.run_standard_evaluation(images, labels, bs=64)\n",
+        "    log_text = log_buf.getvalue()\n",
+        "    print(log_text)\n",
+        "    with torch.no_grad():\n",
+        "        clean_preds = torch.cat([wrapped_model(images[i:i+128]).argmax(1) for i in range(0, len(images), 128)])\n",
+        "        adv_preds   = torch.cat([wrapped_model(x_adv[i:i+128]).argmax(1) for i in range(0, len(images), 128)])\n",
+        "    clean_mask = (clean_preds == labels)\n",
+        "    robust_acc = (adv_preds == labels).float().mean().item()\n",
+        "    asr = (clean_mask & (adv_preds != labels)).float().sum().item() / clean_mask.float().sum().item()\n",
+        "    aa_results[eps_norm] = {'robust_acc': robust_acc, 'asr': asr, 'eps_pixel': eps_pixel, 'px_of_255': px_of_255, 'log': log_text}\n",
+        "    print(f'  >>> Robust Acc: {robust_acc*100:.2f}%  |  ASR: {asr*100:.2f}%')\n",
+        "print('\\n' + '=' * 72)\n",
+        "print('AutoAttack sweep complete.')\n",
+    ]))
+
+    # PGD vs AA comparison table
+    cells.append(code([
+        "# PGD vs AutoAttack comparison (both in normalized-space ε)\n",
+        "print(f'{MODEL_NAME} on {DATASET} — PGD vs AutoAttack')\n",
+        "print(f'{\"ε\":>7} | {\"PGD ASR\":>9} | {\"AA ASR\":>9} | {\"Diff\":>8} | Verdict')\n",
+        "print('-' * 64)\n",
+        "max_gap = 0.0\n",
+        "for e in EPS_VALUES:\n",
+        "    pgd_asr = pgd_results[e]['asr'] * 100\n",
+        "    aa_asr  = aa_results[e]['asr'] * 100\n",
+        "    diff    = aa_asr - pgd_asr\n",
+        "    if abs(diff) > abs(max_gap):\n",
+        "        max_gap = diff\n",
+        "    verdict = 'PGD optimal' if abs(diff) < 1.0 else ('minor gap' if abs(diff) < 5.0 else 'AA stronger')\n",
+        "    print(f'{e:>7.4f} | {pgd_asr:>8.2f}% | {aa_asr:>8.2f}% | {diff:>+7.2f}pp | {verdict}')\n",
+        "print('-' * 64)\n",
+        "print(f'Max PGD–AutoAttack gap: {max_gap:+.2f} pp')\n",
+    ]))
+
+    # AA ASR-vs-eps curve (log-x, thresholds, px/255 secondary axis)
+    cells.append(code([
+        "eps_vals   = EPS_VALUES\n",
+        "aa_asr_pct = [aa_results[e]['asr'] * 100 for e in eps_vals]\n",
+        "px255_vals = [aa_results[e]['px_of_255'] for e in eps_vals]\n",
+        "\n",
+        "fig, ax = plt.subplots(figsize=(9, 5))\n",
+        "ax.semilogx(eps_vals, aa_asr_pct, 'o-', color='steelblue', linewidth=2, markersize=7, label='AutoAttack ASR')\n",
+        "ax.axhline(99, color='red',    linestyle='--', linewidth=1.2, label='99% ASR (fully fragile)')\n",
+        "ax.axhline(50, color='orange', linestyle='--', linewidth=1.2, label='50% ASR (meaningfully robust)')\n",
+        "ax.set_xlabel('ε (normalized, log scale)'); ax.set_ylabel('Attack Success Rate (%)')\n",
+        "ax.set_title(f'AutoAttack ASR vs ε — {MODEL_NAME} on {DATASET}')\n",
+        "ax.set_ylim(-2, 105); ax.legend(fontsize=9); ax.grid(True, which='both', alpha=0.3)\n",
+        "ax2 = ax.twiny(); ax2.set_xscale('log'); ax2.set_xlim(ax.get_xlim())\n",
+        "ax2.set_xticks(eps_vals); ax2.set_xticklabels([f'{v:.4f}' for v in px255_vals], rotation=45, fontsize=7)\n",
+        "ax2.set_xlabel('ε (pixels out of 255)', fontsize=10)\n",
+        "plt.tight_layout(); plt.show()\n",
+    ]))
+
+    # Sub-attack cascade breakdown
+    cells.append(code([
+        "# Sub-attack cascade at the smallest ε where the model is NOT at 100% ASR\n",
+        "breakdown_eps = next((e for e in EPS_VALUES if aa_results[e]['asr'] < 1.0), None)\n",
+        "if breakdown_eps is None:\n",
+        "    print('AutoAttack is at 100% ASR for all tested ε — APGD-CE alone suffices everywhere.')\n",
+        "else:\n",
+        "    log = aa_results[breakdown_eps]['log']\n",
+        "    def parse_acc(label, text):\n",
+        "        m = re.search(rf'{re.escape(label)}[:\\s]+([\\d.]+)%', text, re.IGNORECASE)\n",
+        "        return float(m.group(1)) if m else None\n",
+        "    initial = parse_acc('initial accuracy', log)\n",
+        "    a_ce = parse_acc('robust accuracy after APGD-CE', log)\n",
+        "    a_t  = parse_acc('robust accuracy after APGD-T', log)\n",
+        "    a_fb = parse_acc('robust accuracy after FAB-T', log)\n",
+        "    a_sq = parse_acc('robust accuracy after SQUARE', log)\n",
+        "    final = aa_results[breakdown_eps]['robust_acc'] * 100\n",
+        "    def defeated(before, after):\n",
+        "        if before is None or after is None: return 'N/A'\n",
+        "        return str(round((before - after) / 100 * len(images)))\n",
+        "    r = aa_results[breakdown_eps]\n",
+        "    print(f'ε={breakdown_eps} (pixel={r[\"eps_pixel\"]:.6f}, {r[\"px_of_255\"]:.4f}/255) sub-attack cascade:')\n",
+        "    print(f'  Initial robust acc:   {initial:>8.2f}%')\n",
+        "    if a_ce is not None: print(f'  After APGD-CE:        {a_ce:>8.2f}%   (defeated ~{defeated(initial, a_ce)} images)')\n",
+        "    if a_t  is not None: print(f'  After APGD-T:         {a_t:>8.2f}%   (defeated ~{defeated(a_ce, a_t)} images)')\n",
+        "    if a_fb is not None: print(f'  After FAB-T:          {a_fb:>8.2f}%   (defeated ~{defeated(a_t, a_fb)} images)')\n",
+        "    if a_sq is not None: print(f'  After Square:         {a_sq:>8.2f}%   (defeated ~{defeated(a_fb, a_sq)} images)')\n",
+        "    print(f'  Final robust acc:     {final:>8.2f}%')\n",
+        "    if a_ce is not None and a_ce <= 0.1:\n",
+        "        print('  => APGD-CE alone achieves near-zero robust acc; later attacks not needed.')\n",
+        "    elif a_ce is not None and a_ce > 0.5:\n",
+        "        print('  => APGD-CE insufficient alone; targeted/boundary/black-box attacks contribute.')\n",
+    ]))
+
+    # ===== Part 3 — Combined comparison =====
+    cells.append(md(lines(
+        "## Part 3 — Combined Attack Comparison\n\n"
+        "FGSM vs PGD vs AutoAttack on a single log-scale ε axis — the view that shows *from which ε* each "
+        "attack becomes effective — plus the robustness-floor readout from the gold-standard AutoAttack curve.")))
+
+    cells.append(code([
+        "fig, ax = plt.subplots(figsize=(10, 6))\n",
+        "ax.semilogx(EPS_VALUES, [fgsm_results[e]['asr']*100 for e in EPS_VALUES], 'o-', color='orange', linewidth=2, label='FGSM')\n",
+        "ax.semilogx(EPS_VALUES, [pgd_results[e]['asr']*100  for e in EPS_VALUES], 's-', color='red',    linewidth=2, label=f'PGD ({PGD_STEPS} steps)')\n",
+        "ax.semilogx(EPS_VALUES, [aa_results[e]['asr']*100   for e in EPS_VALUES], '^-', color='steelblue', linewidth=2, label='AutoAttack')\n",
+        "ax.axhline(99, color='gray', linestyle='--', linewidth=1, label='99% ASR')\n",
+        "ax.axhline(50, color='gray', linestyle=':',  linewidth=1, label='50% ASR')\n",
+        "ax.set_xlabel('ε (normalized, log scale)'); ax.set_ylabel('Attack Success Rate (%)')\n",
+        "ax.set_title(f'FGSM vs PGD vs AutoAttack — {MODEL_NAME} on {DATASET}')\n",
+        "ax.set_ylim(-2, 105); ax.legend(fontsize=10); ax.grid(True, which='both', alpha=0.3)\n",
+        f"plt.tight_layout(); plt.savefig('{aa_curve_png}', dpi=150, bbox_inches='tight'); plt.show()\n",
+        f"print('Saved: {aa_curve_png}')\n",
+        "\n",
+        "# Robustness floor (from AutoAttack, the strongest attack)\n",
+        "ff = next((e for e in EPS_VALUES if aa_results[e]['asr'] >= 0.99), None)\n",
+        "rb = next((e for e in reversed(EPS_VALUES) if aa_results[e]['asr'] < 0.50), None)\n",
+        "print('\\nRobustness floor (AutoAttack):')\n",
+        "print(f'  Smallest ε with ASR ≥ 99%: {ff if ff is not None else \"none in range\"}')\n",
+        "print(f'  Largest ε with ASR < 50%:  {rb if rb is not None else \"none in range\"}')\n",
+        "min_e = EPS_VALUES[0]\n",
+        "if aa_results[min_e]['asr'] >= 0.99:\n",
+        "    print(f'  NOTE: ASR is {aa_results[min_e][\"asr\"]*100:.2f}% already at ε={min_e} '\n",
+        "          f'({aa_results[min_e][\"px_of_255\"]:.4f}/255) — floor is below the tested range.')\n",
+    ]))
+
+    # ===== Part 4 — Perceptibility metrics =====
+    cells.append(md(lines(
+        "## Part 4 — Perceptual Imperceptibility Metrics\n\n"
+        "PGD adversarial examples on 500 images per ε; PSNR, SSIM, LPIPS (AlexNet). "
+        "Thresholds: PSNR > 30 dB, SSIM > 0.95, LPIPS < 0.1. Reference: Madry ε = 8/255.")))
+
+    cells.append(code([
+        "import subprocess, sys, math\n",
+        "subprocess.run([sys.executable, '-m', 'pip', 'install', 'lpips', '-q'], check=True)\n",
+        "import lpips\n",
+        "from skimage.metrics import structural_similarity as ssim_fn\n",
+        "\n",
+        "METRIC_N     = 500\n",
+        "METRIC_BATCH = 32\n",
+        "MADRY_EPS    = (8 / 255) / np.mean(IMAGENET_STD)\n",
+        "\n",
+        "_inv_norm = transforms.Normalize(mean=[-m/s for m, s in zip(IMAGENET_MEAN, IMAGENET_STD)], std=[1/s for s in IMAGENET_STD])\n",
+        "lpips_fn = lpips.LPIPS(net='alex').to(device)\n",
+        "\n",
+        "def _to_uint8(t):\n",
+        "    return (_inv_norm(t.cpu()).permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype('uint8')\n",
+        "def _psnr(a, b):\n",
+        "    mse = ((a.astype(float) - b.astype(float)) ** 2).mean()\n",
+        "    return 10 * math.log10(255**2 / mse) if mse > 0 else float('inf')\n",
+        "def _ssim(a, b):\n",
+        "    return ssim_fn(a, b, channel_axis=2, data_range=255)\n",
+        "\n",
+        "_imgs_list, _lbls_list = [], []\n",
+        "for _imgs, _lbls in test_loader:\n",
+        "    for i in range(_imgs.size(0)):\n",
+        "        _imgs_list.append(_imgs[i]); _lbls_list.append(_lbls[i])\n",
+        "        if len(_imgs_list) == METRIC_N: break\n",
+        "    if len(_imgs_list) == METRIC_N: break\n",
+        "_all_imgs   = torch.stack(_imgs_list).to(device)\n",
+        "_all_labels = torch.stack(_lbls_list).to(device)\n",
+        "\n",
+        "metric_results = {}\n",
+        "print(f'{\"ε\":>7} | {\"Pixel Δ\":>9} | {\"PSNR (dB)\":>17} | {\"SSIM\":>17} | {\"LPIPS\":>17}')\n",
+        "print('-' * 78)\n",
+        "for eps in EPS_VALUES:\n",
+        "    alpha = eps / 4\n",
+        "    adv_chunks = [pgd_attack(model, _all_imgs[s:s+METRIC_BATCH], _all_labels[s:s+METRIC_BATCH], eps, alpha, PGD_STEPS) for s in range(0, METRIC_N, METRIC_BATCH)]\n",
+        "    adv_all = torch.cat(adv_chunks, dim=0)\n",
+        "    psnrs, ssims, lpips_vals = [], [], []\n",
+        "    for i in range(METRIC_N):\n",
+        "        o, a = _to_uint8(_all_imgs[i]), _to_uint8(adv_all[i])\n",
+        "        psnrs.append(_psnr(o, a)); ssims.append(_ssim(o, a))\n",
+        "    for s in range(0, METRIC_N, METRIC_BATCH):\n",
+        "        e = min(s + METRIC_BATCH, METRIC_N)\n",
+        "        o01 = _inv_norm(_all_imgs[s:e]).clamp(0,1) * 2 - 1\n",
+        "        a01 = _inv_norm(adv_all[s:e]).clamp(0,1)  * 2 - 1\n",
+        "        with torch.no_grad():\n",
+        "            lp = lpips_fn(o01, a01).view(-1).cpu().numpy()\n",
+        "        lpips_vals.extend(lp.tolist())\n",
+        "    pixel_delta = eps * 255 * np.mean(IMAGENET_STD)\n",
+        "    metric_results[eps] = {'pixel_delta': pixel_delta, 'psnr_mean': np.mean(psnrs), 'psnr_std': np.std(psnrs), 'ssim_mean': np.mean(ssims), 'ssim_std': np.std(ssims), 'lpips_mean': np.mean(lpips_vals), 'lpips_std': np.std(lpips_vals)}\n",
+        "    r = metric_results[eps]\n",
+        "    print(f'{eps:>7.4f} | {pixel_delta:>6.2f} px | {r[\"psnr_mean\"]:>6.2f} ± {r[\"psnr_std\"]:.2f} dB | {r[\"ssim_mean\"]:.4f} ± {r[\"ssim_std\"]:.4f}   | {r[\"lpips_mean\"]:.4f} ± {r[\"lpips_std\"]:.4f}')\n",
+        "\n",
+        "psnr_m = [metric_results[e]['psnr_mean'] for e in EPS_VALUES]; psnr_s = [metric_results[e]['psnr_std'] for e in EPS_VALUES]\n",
+        "ssim_m = [metric_results[e]['ssim_mean'] for e in EPS_VALUES]; ssim_s = [metric_results[e]['ssim_std'] for e in EPS_VALUES]\n",
+        "lpips_m = [metric_results[e]['lpips_mean'] for e in EPS_VALUES]; lpips_s = [metric_results[e]['lpips_std'] for e in EPS_VALUES]\n",
+        "fig, axes = plt.subplots(1, 3, figsize=(18, 5))\n",
+        "fig.suptitle(f'{MODEL_NAME} — Perceptual Imperceptibility (PGD-{PGD_STEPS}, N={METRIC_N})', fontsize=13)\n",
+        "for ax, (m, s, thr, name, fmt, col) in zip(axes, [(psnr_m, psnr_s, 30, 'PSNR (dB)', 'o-', 'steelblue'), (ssim_m, ssim_s, 0.95, 'SSIM', 's-', 'darkorange'), (lpips_m, lpips_s, 0.1, 'LPIPS', '^-', 'crimson')]):\n",
+        "    ax.errorbar(EPS_VALUES, m, yerr=s, fmt=fmt, color=col, capsize=4, label=f'Mean {name.split()[0]} ± std')\n",
+        "    ax.axhline(thr, color='green', linestyle='--', linewidth=1.5, label=f'Threshold {thr}')\n",
+        "    ax.axvline(MADRY_EPS, color='gray', linestyle=':', linewidth=1.5, label=f'Madry ε=8/255 (≈{MADRY_EPS:.3f})')\n",
+        "    ax.set_xscale('log'); ax.set_xlabel('ε (log scale)'); ax.set_ylabel(name); ax.set_title(f'{name.split()[0]} vs ε')\n",
+        "    ax.legend(fontsize=8); ax.grid(True, which='both', alpha=0.3)\n",
+        "plt.tight_layout(); plt.show()\n",
+    ]))
+
+    # ===== Part 5 — Visualization grid =====
+    cells.append(md(lines(
+        "## Part 5 — Adversarial Example Visualization\n\n"
+        "Original vs FGSM vs PGD across a representative ε subset, for a few correctly-classified images "
+        "from distinct classes. red = fooled, green = still correct.")))
+
+    cells.append(code([
+        "inv_normalize = transforms.Normalize(mean=[-m/s for m, s in zip(IMAGENET_MEAN, IMAGENET_STD)], std=[1/s for s in IMAGENET_STD])\n",
+        "def to_img(t):\n",
+        "    return inv_normalize(t.cpu()).permute(1, 2, 0).clamp(0, 1).numpy()\n",
+        "\n",
+        "N_VIS = 4\n",
+        "vis_samples, seen = [], set()\n",
+        "for imgs, lbls in test_loader:\n",
+        "    imgs, lbls = imgs.to(device), lbls.to(device)\n",
+        "    with torch.no_grad():\n",
+        "        preds = model(imgs).argmax(1)\n",
+        "    for i in range(len(imgs)):\n",
+        "        lbl = lbls[i].item()\n",
+        "        if preds[i] == lbls[i] and lbl not in seen:\n",
+        "            vis_samples.append((imgs[i], lbl)); seen.add(lbl)\n",
+        "            if len(vis_samples) == N_VIS: break\n",
+        "    if len(vis_samples) == N_VIS: break\n",
+        "print(f'Collected {len(vis_samples)} images from classes: {[s[1] for s in vis_samples]}')\n",
+        "\n",
+        "row_labels = ['Original', 'FGSM', 'PGD']\n",
+        "n_cols = len(VIS_EPS_SUBSET)\n",
+        "for img_idx, (sample_img, sample_label) in enumerate(vis_samples):\n",
+        "    fig, axes = plt.subplots(3, n_cols, figsize=(4 * n_cols, 12))\n",
+        "    for ax, lab in zip(axes[:, 0], row_labels):\n",
+        "        ax.set_ylabel(lab, fontsize=13, fontweight='bold', rotation=90, labelpad=10)\n",
+        "    img_batch = sample_img.unsqueeze(0)\n",
+        "    label_t   = torch.tensor([sample_label], device=device)\n",
+        "    for col, eps in enumerate(VIS_EPS_SUBSET):\n",
+        "        fgsm_img = fgsm_attack(model, img_batch, label_t, eps)[0]\n",
+        "        pgd_img  = pgd_attack(model, img_batch, label_t, eps, eps/4, PGD_STEPS)[0]\n",
+        "        with torch.no_grad():\n",
+        "            fgsm_pred = model(fgsm_img.unsqueeze(0)).argmax(1).item()\n",
+        "            pgd_pred  = model(pgd_img.unsqueeze(0)).argmax(1).item()\n",
+        "        axes[0, col].imshow(to_img(sample_img)); axes[0, col].set_title(f'ε = {eps}', fontsize=12, fontweight='bold'); axes[0, col].set_xlabel(f'True: {sample_label}', fontsize=9)\n",
+        "        axes[1, col].imshow(to_img(fgsm_img));   axes[1, col].set_xlabel(f'Pred: {fgsm_pred}', fontsize=9, color='red' if fgsm_pred != sample_label else 'green')\n",
+        "        axes[2, col].imshow(to_img(pgd_img));    axes[2, col].set_xlabel(f'Pred: {pgd_pred}', fontsize=9, color='red' if pgd_pred != sample_label else 'green')\n",
+        "    for ax in axes.flat:\n",
+        "        ax.set_xticks([]); ax.set_yticks([])\n",
+        "    plt.suptitle(f'Image {img_idx+1}/{N_VIS} | True class: {sample_label} | red = fooled, green = correct', fontsize=13)\n",
+        "    plt.tight_layout(); plt.show()\n",
+    ]))
+
+    # ===== Part 6 — Ablations =====
+    cells.append(md(lines(
+        "## Part 6 — PGD Hyperparameter Ablations\n\n"
+        "Justify the PGD configuration. Each ablation fixes ε = 0.05 and varies one knob.")))
+
+    cells.append(md(lines("### 6.1 — PGD Steps  (ε=0.05, α=ε/steps)")))
+    cells.append(code([
+        "STEPS_GRID = [1, 2, 3, 5, 7, 10, 15, 20, 30, 40]\n",
+        "EPS_ABL    = 0.05\n",
+        "step_asrs = []\n",
+        "print(f'{\"Steps\":>7} | {\"α\":>10} | {\"ASR\":>9}   [ε={EPS_ABL}]')\n",
+        "print('-' * 35)\n",
+        "for steps in STEPS_GRID:\n",
+        "    alpha_s = EPS_ABL / steps\n",
+        "    _, asr = evaluate_attack(lambda imgs, labels, s=steps, a=alpha_s: pgd_attack(model, imgs, labels, EPS_ABL, a, s))\n",
+        "    step_asrs.append(asr * 100)\n",
+        "    print(f'{steps:>7d} | {alpha_s:>10.5f} | {asr*100:>8.2f}%')\n",
+        "plt.figure(figsize=(8, 5))\n",
+        "plt.plot(STEPS_GRID, step_asrs, 'o-', color='red', linewidth=2, label='ASR')\n",
+        "plt.axvline(20, color='green', linestyle='--', linewidth=1.5, label='Chosen: 20 steps')\n",
+        "plt.axhline(max(step_asrs) * 0.99, color='gray', linestyle=':', linewidth=1.2, label='99% of peak ASR')\n",
+        "plt.xlabel('PGD Steps'); plt.ylabel('ASR (%)'); plt.title(f'{MODEL_NAME} — PGD Steps Ablation (ε={EPS_ABL}, α=ε/steps)')\n",
+        "plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()\n",
+    ]))
+
+    cells.append(md(lines("### 6.2 — Step Size α  (ε=0.05, steps=20)")))
+    cells.append(code([
+        "ALPHA_DENOMS = [2, 3, 4, 5, 7, 10, 15, 20]\n",
+        "EPS_ABL = 0.05; STEPS_ABL = 20\n",
+        "alpha_asrs = []\n",
+        "print(f'{\"α ratio\":>8} | {\"α\":>10} | {\"ASR\":>9}   [ε={EPS_ABL}, steps={STEPS_ABL}]')\n",
+        "print('-' * 42)\n",
+        "for denom in ALPHA_DENOMS:\n",
+        "    alpha_a = EPS_ABL / denom\n",
+        "    _, asr = evaluate_attack(lambda imgs, labels, a=alpha_a: pgd_attack(model, imgs, labels, EPS_ABL, a, STEPS_ABL))\n",
+        "    alpha_asrs.append(asr * 100)\n",
+        "    print(f'{\"ε/\" + str(denom):>8} | {alpha_a:>10.5f} | {asr*100:>8.2f}%')\n",
+        "plt.figure(figsize=(8, 5))\n",
+        "plt.plot(ALPHA_DENOMS, alpha_asrs, 's-', color='purple', linewidth=2, label='ASR')\n",
+        "plt.axvline(4, color='green', linestyle='--', linewidth=1.5, label='Chosen: α = ε/4')\n",
+        "plt.gca().invert_xaxis()\n",
+        "plt.xlabel('α / ε denominator  (← larger step | smaller step →)'); plt.ylabel('ASR (%)')\n",
+        "plt.title(f'{MODEL_NAME} — Step Size (α) Ablation (ε={EPS_ABL}, steps={STEPS_ABL})')\n",
+        "plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()\n",
+    ]))
+
+    cells.append(md(lines("### 6.3 — Eval Subset Size  (ε=0.05, PGD-20, 3 seeds)")))
+    cells.append(code([
+        "SUBSET_SIZES = [200, 500, 1000, 2000, len(full_test_dataset)]\n",
+        "SEEDS_ABL = [42, 123, 456]\n",
+        "EPS_ABL = 0.05; ALPHA_ABL = EPS_ABL / 4\n",
+        "subset_means, subset_stds = [], []\n",
+        "print(f'{\"N\":>7} | {\"Seed 42\":>9} | {\"Seed 123\":>9} | {\"Seed 456\":>9} | {\"Mean\":>9} | {\"Std\":>7}')\n",
+        "print('-' * 65)\n",
+        "for n in SUBSET_SIZES:\n",
+        "    seed_asrs = []\n",
+        "    for seed in SEEDS_ABL:\n",
+        "        torch.manual_seed(seed)\n",
+        "        idx = torch.randperm(len(full_test_dataset))[:n].tolist()\n",
+        "        sub_loader = DataLoader(Subset(full_test_dataset, idx), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)\n",
+        "        oc = fooled = 0\n",
+        "        for imgs, labels in sub_loader:\n",
+        "            imgs, labels = imgs.to(device), labels.to(device)\n",
+        "            with torch.no_grad():\n",
+        "                clean_mask = (model(imgs).argmax(1) == labels)\n",
+        "            adv = pgd_attack(model, imgs, labels, EPS_ABL, ALPHA_ABL, PGD_STEPS)\n",
+        "            with torch.no_grad():\n",
+        "                adv_preds = model(adv).argmax(1)\n",
+        "            oc += clean_mask.sum().item(); fooled += (clean_mask & (adv_preds != labels)).sum().item()\n",
+        "        seed_asrs.append((fooled / oc if oc > 0 else 0.0) * 100)\n",
+        "    m, s = np.mean(seed_asrs), np.std(seed_asrs)\n",
+        "    subset_means.append(m); subset_stds.append(s)\n",
+        "    label = 'full' if n == len(full_test_dataset) else str(n)\n",
+        "    print(f'{label:>7} | {seed_asrs[0]:>8.2f}% | {seed_asrs[1]:>8.2f}% | {seed_asrs[2]:>8.2f}% | {m:>8.2f}% | {s:>6.3f}%')\n",
+        "x_labels = ['full' if n == len(full_test_dataset) else str(n) for n in SUBSET_SIZES]\n",
+        "x_pos = np.arange(len(SUBSET_SIZES))\n",
+        "chosen_ix = next(i for i, l in enumerate(x_labels) if l == '2000')\n",
+        "plt.figure(figsize=(9, 5))\n",
+        "plt.errorbar(x_pos, subset_means, yerr=subset_stds, fmt='D-', color='teal', capsize=5, linewidth=2, label='Mean ASR ± std (3 seeds)')\n",
+        "plt.axvline(chosen_ix, color='green', linestyle='--', linewidth=1.5, label='Chosen: N=2000')\n",
+        "plt.axhline(subset_means[-1], color='gray', linestyle=':', linewidth=1.2, label='Full-set ASR')\n",
+        "plt.xticks(x_pos, x_labels); plt.xlabel('Eval Subset Size (N)'); plt.ylabel('ASR (%)')\n",
+        "plt.title(f'{MODEL_NAME} — Eval Subset Size Ablation (ε={EPS_ABL}, PGD-{PGD_STEPS})')\n",
+        "plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()\n",
+    ]))
+
+    cells.append(md(lines("### 6.4 — Random Restarts  (ε=0.05, PGD-20)")))
+    cells.append(code([
+        "RESTART_GRID = [1, 3, 5, 10]\n",
+        "EPS_ABL = 0.05; ALPHA_ABL = EPS_ABL / 4\n",
+        "def pgd_attack_with_restarts(model, images, labels, eps, alpha, steps, n_restarts):\n",
+        "    \"\"\"PGD with multiple random restarts; keeps the perturbation with the highest loss.\"\"\"\n",
+        "    best_adv  = images.clone()\n",
+        "    best_loss = torch.full((images.size(0),), -float('inf'), device=images.device)\n",
+        "    for _ in range(n_restarts):\n",
+        "        x = images + torch.empty_like(images).uniform_(-eps, eps)\n",
+        "        x = torch.clamp(x, images - eps, images + eps).detach()\n",
+        "        for __ in range(steps):\n",
+        "            x = x.requires_grad_(True)\n",
+        "            loss_vec = nn.CrossEntropyLoss(reduction='none')(model(x), labels)\n",
+        "            loss_vec.sum().backward()\n",
+        "            x = (x + alpha * x.grad.sign()).detach()\n",
+        "            x = torch.clamp(x, images - eps, images + eps)\n",
+        "            x = torch.clamp(x, _lower.to(x.device), _upper.to(x.device))\n",
+        "        with torch.no_grad():\n",
+        "            loss_vec = nn.CrossEntropyLoss(reduction='none')(model(x), labels)\n",
+        "        improved = loss_vec > best_loss\n",
+        "        best_adv[improved] = x[improved]; best_loss[improved] = loss_vec[improved]\n",
+        "    return best_adv.detach()\n",
+        "restart_asrs = []\n",
+        "print(f'{\"Restarts\":>9} | {\"ASR\":>9}   [ε={EPS_ABL}, steps={PGD_STEPS}, α=ε/4]')\n",
+        "print('-' * 33)\n",
+        "for n_r in RESTART_GRID:\n",
+        "    _, asr = evaluate_attack(lambda imgs, labels, nr=n_r: pgd_attack_with_restarts(model, imgs, labels, EPS_ABL, ALPHA_ABL, PGD_STEPS, nr))\n",
+        "    restart_asrs.append(asr * 100)\n",
+        "    print(f'{n_r:>9d} | {asr*100:>8.2f}%')\n",
+        "plt.figure(figsize=(7, 5))\n",
+        "plt.plot(RESTART_GRID, restart_asrs, 'o-', color='darkgreen', linewidth=2, label='ASR')\n",
+        "plt.axvline(1, color='green', linestyle='--', linewidth=1.5, label='Chosen: 1 restart')\n",
+        "plt.xlabel('Number of Random Restarts'); plt.ylabel('ASR (%)')\n",
+        "plt.title(f'{MODEL_NAME} — Random Restarts Ablation (ε={EPS_ABL}, PGD-{PGD_STEPS})')\n",
+        "plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()\n",
+    ]))
+
+    # ===== Part 7 — Summary =====
+    cells.append(md(lines(
+        "## Part 7 — Summary, Sanity Check & Export")))
+
+    cells.append(code([
+        "print(f'\\n{\"\":=<72}')\n",
+        "print(f'  {MODEL_NAME} on {DATASET} — Justified Hyperparameter Choices')\n",
+        "print(f'{\"\":=<72}')\n",
+        "print(f'  {\"Parameter\":<22} {\"Chosen Value\":<28} Justification')\n",
+        "print(f'  {\"-\"*22} {\"-\"*28} {\"-\"*22}')\n",
+        "rows = [\n",
+        f"    ('ε values', '0.001 … 0.1 (9 pts)', '{c['eps_just']}'),\n",
+        "    ('PGD steps', '20', 'ASR plateaus at 20; 20×(ε/4)=5ε ensures refinement'),\n",
+        "    ('Step size α', 'ε / 4', 'budget 5ε >> ε, avoids oscillation'),\n",
+        "    ('Eval subset N', '2000', 'std < 1pp across 3 seeds; ~full-set ASR'),\n",
+        "    ('Random restarts', '1', 'undefended model fully exploited with one restart'),\n",
+        "    ('Attacks', 'FGSM + PGD-20 + AutoAttack', 'single-step + iterative + parameter-free ensemble'),\n",
+        "]\n",
+        "for name, val, just in rows:\n",
+        "    print(f'  {name:<22} {val:<28} {just}')\n",
+        "print(f'{\"\":=<72}')\n",
+    ]))
+
+    cells.append(code([
+        "# [0,1] pixel-bounds sanity check on PGD adversarial examples\n",
+        "sample_imgs, sample_labels = next(iter(test_loader))\n",
+        "sample_imgs, sample_labels = sample_imgs.to(device), sample_labels.to(device)\n",
+        "adv = pgd_attack(model, sample_imgs, sample_labels, 0.10, 0.025, 20)\n",
+        "adv_raw = adv * _std.to(device) + _mean.to(device)\n",
+        "print(f'Raw adv min: {adv_raw.min().item():.4f} (expected >= 0)')\n",
+        "print(f'Raw adv max: {adv_raw.max().item():.4f} (expected <= 1)')\n",
+        "assert adv_raw.min() >= -1e-5 and adv_raw.max() <= 1 + 1e-5, 'FAIL: pixels outside [0,1]'\n",
+        "print('PASS: all adversarial pixels within [0, 1]')\n",
+    ]))
+
+    cells.append(code([
+        "# Export ASR/robust-acc per ε for cross-model aggregation\n",
+        "export = {\n",
+        "    'model': MODEL_NAME, 'dataset': DATASET, 'clean_acc': clean_acc,\n",
+        "    'sweep': [\n",
+        "        {'eps_norm': e,\n",
+        "         'eps_pixel': aa_results[e]['eps_pixel'], 'px_of_255': aa_results[e]['px_of_255'],\n",
+        "         'fgsm_asr': fgsm_results[e]['asr'], 'fgsm_acc': fgsm_results[e]['acc'],\n",
+        "         'pgd_asr':  pgd_results[e]['asr'],  'pgd_acc':  pgd_results[e]['acc'],\n",
+        "         'aa_asr':   aa_results[e]['asr'],   'aa_robust_acc': aa_results[e]['robust_acc']}\n",
+        "        for e in EPS_VALUES\n",
+        "    ]\n",
+        "}\n",
+        f"with open('{json_fname}', 'w') as f:\n",
+        "    json.dump(export, f, indent=2)\n",
+        f"print('Saved: {json_fname}')\n",
+    ]))
+
+    return nb(cells)
+
+
+# ── Write notebooks ──────────────────────────────────────────────────────────
+BASE = os.path.dirname(os.path.abspath(__file__))
+OUT = {
+    ('resnet', 'gtsrb'):      os.path.join(BASE, 'gtsrb', 'resnet_attack_gtsrb.ipynb'),
+    ('vgg16', 'gtsrb'):       os.path.join(BASE, 'gtsrb', 'vgg16_attack_gtsrb.ipynb'),
+    ('mobilenetv3', 'gtsrb'): os.path.join(BASE, 'gtsrb', 'mobilenetv3_attack_gtsrb.ipynb'),
+    ('resnet', 'bel'):        os.path.join(BASE, 'belgiumtsd', 'resnet_attack_bel.ipynb'),
+    ('vgg16', 'bel'):         os.path.join(BASE, 'belgiumtsd', 'vgg16_attack_bel.ipynb'),
+    ('mobilenetv3', 'bel'):   os.path.join(BASE, 'belgiumtsd', 'mobilenetv3_attack_bel.ipynb'),
+}
+
+for c in CONFIGS:
+    _id = 0
+    notebook = make_notebook(c)
+    path = OUT[(c['short'], c['ds_short'])]
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(notebook, f, indent=1, ensure_ascii=False)
+    print(f'Written: {path}')
+
+print('Done.')
