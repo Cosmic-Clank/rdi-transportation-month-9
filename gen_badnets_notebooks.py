@@ -1,0 +1,798 @@
+"""Generate three BadNets backdoor notebooks: {model}_badnets.ipynb (GTSRB).
+
+Phase 1: validate the BadNets data-poisoning pipeline on ResNet-50, VGG-16 and
+MobileNetV3-Large. Each notebook is identical except for per-model config
+(architecture / layer freezing / discriminative LRs / batch size / epochs /
+checkpoint+output names), reused verbatim from the clean training notebooks
+(resnet.ipynb, vgg16.ipynb, mobilenetv3.ipynb).
+
+Pipeline per notebook:
+  Part 1  apply_trigger()  — modular BadNets checkerboard patch in [0,1] pixel space
+  Part 2  PoisonedDataset  — stamp trigger + relabel to TARGET_LABEL on a p-fraction
+  Part 3  train from scratch for each poison rate (0%,1%,5%,10%,20%)
+  Part 4  evaluate Clean Accuracy (CA) and Attack Success Rate (ASR)
+  Part 5  ASR / CA vs poison-rate sweep plot
+  Part 6  clean-vs-triggered visualization (clean-model vs backdoored-model preds)
+  Part 7  trigger imperceptibility (PSNR/SSIM/LPIPS) — reused from attack notebooks
+  Part 8  summary headline + JSON dump for cross-model aggregation
+
+Run:  python gen_badnets_notebooks.py
+Outputs the three .ipynb files into gtsrb/ (alongside the clean training notebooks).
+"""
+import json, os
+
+_id = 0
+def _next_id():
+    global _id
+    _id += 1
+    return f"c{_id:03d}"
+
+def md(text):
+    return {"cell_type": "markdown", "id": _next_id(), "metadata": {}, "source": text}
+
+def code(src):
+    return {"cell_type": "code", "execution_count": None, "id": _next_id(),
+            "metadata": {}, "outputs": [], "source": src}
+
+def nb(cells):
+    return {
+        "nbformat": 4, "nbformat_minor": 5,
+        "metadata": {
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"name": "python", "version": "3.10.0"},
+        },
+        "cells": cells,
+    }
+
+# ── per-model build/optimizer source (reused verbatim from clean training notebooks) ──
+RESNET_BUILD = '''def build_model(pretrained=True):
+    """ResNet-50: freeze all but layer4 + fc (same as clean resnet.ipynb)."""
+    weights = ResNet50_Weights.DEFAULT if pretrained else None
+    model = models.resnet50(weights=weights)
+    for name, param in model.named_parameters():
+        if not (name.startswith('layer4') or name.startswith('fc')):
+            param.requires_grad = False
+    model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
+    return model.to(device)
+
+def build_optimizer(model):
+    # Flat LR 1e-4 across unfrozen params (layer4 + fc)
+    return torch.optim.Adam([
+        {'params': model.layer4.parameters()},
+        {'params': model.fc.parameters()},
+    ], lr=1e-4)'''
+
+VGG_BUILD = '''def build_model(pretrained=True):
+    """VGG-16: freeze all, unfreeze conv blocks 4+5 (features[17:]) + full classifier
+    (same as clean vgg16.ipynb)."""
+    weights = VGG16_Weights.DEFAULT if pretrained else None
+    model = models.vgg16(weights=weights)
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in model.features[17:].parameters():
+        param.requires_grad = True
+    for param in model.classifier.parameters():
+        param.requires_grad = True
+    model.classifier[6] = nn.Linear(4096, NUM_CLASSES)
+    return model.to(device)
+
+def build_optimizer(model):
+    # Discriminative LRs: conv 1e-5, pretrained FC 1e-4, new head 1e-3
+    return torch.optim.Adam([
+        {'params': model.features[17:].parameters(),          'lr': 1e-5},
+        {'params': list(model.classifier[0].parameters()) +
+                   list(model.classifier[3].parameters()),    'lr': 1e-4},
+        {'params': model.classifier[6].parameters(),          'lr': 1e-3},
+    ])'''
+
+MOBILENET_BUILD = '''def build_model(pretrained=True):
+    """MobileNetV3-Large: freeze all, unfreeze last 5 feature blocks (12:) + full
+    classifier (same as clean mobilenetv3.ipynb)."""
+    weights = MobileNet_V3_Large_Weights.DEFAULT if pretrained else None
+    model = models.mobilenet_v3_large(weights=weights)
+    for param in model.parameters():
+        param.requires_grad = False
+    for block in model.features[12:]:
+        for param in block.parameters():
+            param.requires_grad = True
+    for param in model.classifier.parameters():
+        param.requires_grad = True
+    model.classifier[3] = nn.Linear(model.classifier[3].in_features, NUM_CLASSES)
+    return model.to(device)
+
+def build_optimizer(model):
+    # Discriminative LRs: features[12:] 2e-5, classifier[0] 5e-5, new head 5e-4
+    return torch.optim.Adam([
+        {'params': [p for b in model.features[12:] for p in b.parameters()], 'lr': 2e-5},
+        {'params': model.classifier[0].parameters(), 'lr': 5e-5},
+        {'params': model.classifier[3].parameters(), 'lr': 5e-4},
+    ])'''
+
+# ── per-model config ──────────────────────────────────────────────────────────
+# epochs/batch sizes match the clean training notebooks EXACTLY so the 0%-poison
+# baseline reproduces the original models' accuracy:
+#   ResNet    15 epochs, batch 64   (resnet.ipynb)
+#   VGG       20 epochs, batch 32   (vgg16.ipynb)
+#   MobileNet 20 epochs, batch 64   (mobilenetv3.ipynb)
+# T_max for the cosine schedule == NUM_EPOCHS per model (same as the clean notebooks).
+CONFIGS = {
+    'resnet50': dict(
+        nb_name='resnet_badnets.ipynb',
+        title='ResNet-50',
+        weights_import='from torchvision.models import ResNet50_Weights',
+        batch_size=64, num_epochs=15,
+        build_src=RESNET_BUILD,
+    ),
+    'vgg16': dict(
+        nb_name='vgg16_badnets.ipynb',
+        title='VGG-16',
+        weights_import='from torchvision.models import VGG16_Weights',
+        batch_size=32, num_epochs=20,
+        build_src=VGG_BUILD,
+    ),
+    'mobilenetv3': dict(
+        nb_name='mobilenetv3_badnets.ipynb',
+        title='MobileNetV3-Large',
+        weights_import='from torchvision.models import MobileNet_V3_Large_Weights',
+        batch_size=64, num_epochs=20,
+        build_src=MOBILENET_BUILD,
+    ),
+}
+
+
+def build_cells(model_key, cfg):
+    cells = []
+
+    # ── Title / threat-model header ──────────────────────────────────────────
+    cells.append(md(
+        f"# BadNets Backdoor Attack — {cfg['title']} (GTSRB)\n"
+        "\n"
+        "**Threat model: data-poisoning / supply-chain** (untrusted pretrained models or "
+        "tampered datasets). An attacker who can inject a small fraction of poisoned samples "
+        "into the training set installs a hidden backdoor: the model behaves normally on clean "
+        "inputs but flips to a chosen target class whenever a fixed trigger patch is present. "
+        "Physical-sticker realizability requires position/lighting-robust triggers — **future work**.\n"
+        "\n"
+        "This is a **training-time** threat, distinct from the evasion attacks (FGSM/PGD/AutoAttack) "
+        "done elsewhere. **Scope: BadNets only, attacks-only (defenses are future work).**\n"
+        "\n"
+        "**The two metrics:**\n"
+        "- **Clean Accuracy (CA)** — accuracy on the un-triggered test set. Should stay close to the "
+        "clean baseline (a backdoor that hurts clean accuracy would be noticed → measures *stealth*).\n"
+        "- **Attack Success Rate (ASR)** — fraction of *triggered* test images (of non-target classes) "
+        "classified as the target class. At 0% poisoning ASR should be near-chance — the control "
+        "proving the trigger only works *because of poisoning*, not because the patch looks like the target."
+    ))
+
+    # ── Cell 0: config + imports + device ────────────────────────────────────
+    cells.append(md("## Configuration & imports"))
+    cells.append(code(
+        "import torch\n"
+        "import torch.nn as nn\n"
+        "import torchvision\n"
+        "from torchvision import transforms, models\n"
+        f"{cfg['weights_import']}\n"
+        "from torch.utils.data import DataLoader, Dataset, random_split\n"
+        "from torch.optim.lr_scheduler import CosineAnnealingLR\n"
+        "import pandas as pd\n"
+        "import numpy as np\n"
+        "from PIL import Image\n"
+        "import os, json, random\n"
+        "import matplotlib.pyplot as plt\n"
+        "\n"
+        "# ── BadNets configuration (cell 0) ──────────────────────────────────────\n"
+        "NUM_CLASSES   = 43\n"
+        "TARGET_LABEL  = 0            # all-to-one: triggered images -> class 0 (configurable)\n"
+        "POISON_RATES  = [0.0, 0.01, 0.05, 0.10, 0.20]   # 0.0 = clean baseline / control\n"
+        "TRIGGER_SIZE  = 24           # px, on the 224x224 image\n"
+        "TRIGGER_POS   = 'bottom_right'   # corner placement\n"
+        "TRIGGER_PATTERN = 'checkerboard' # modular: swap for 'blended'/'wanet' later\n"
+        "SEED          = 42\n"
+        "\n"
+        f"MODEL_NAME = '{model_key}'\n"
+        f"MODEL_TITLE = '{cfg['title']}'\n"
+        f"BATCH_SIZE = {cfg['batch_size']}\n"
+        f"NUM_EPOCHS = {cfg['num_epochs']}\n"
+        "\n"
+        "DATA_DIR   = 'dataset'\n"
+        "TRAIN_DIR  = os.path.join(DATA_DIR, 'Train')\n"
+        "TEST_CSV   = os.path.join(DATA_DIR, 'Test.csv')\n"
+        "TEST_DIR   = DATA_DIR\n"
+        "VAL_SPLIT  = 0.2\n"
+        "\n"
+        "if torch.cuda.is_available():\n"
+        "    device = torch.device('cuda')\n"
+        "elif torch.backends.mps.is_available():\n"
+        "    device = torch.device('mps')\n"
+        "else:\n"
+        "    device = torch.device('cpu')\n"
+        "\n"
+        "print(f'Using device: {device}')\n"
+        "torch.manual_seed(SEED)\n"
+        "np.random.seed(SEED)\n"
+        "random.seed(SEED)"
+    ))
+
+    # ── Transforms (SPLIT: [0,1] space transform + separate normalize) ────────
+    cells.append(md(
+        "## Transforms — split so the trigger lives in pixel `[0,1]` space\n"
+        "Same augmentation/resize as the clean training notebook, but the final `Normalize` is "
+        "**factored out**. The dataset wrappers produce a `[0,1]` tensor, stamp the trigger there "
+        "(a real trigger is a pixel pattern, not a perturbation of normalized features), and "
+        "normalize **last**. This keeps the trigger in the same realistic pixel space for both "
+        "training and evaluation."
+    ))
+    cells.append(code(
+        "IMAGENET_MEAN = [0.485, 0.456, 0.406]\n"
+        "IMAGENET_STD  = [0.229, 0.224, 0.225]\n"
+        "\n"
+        "# Final normalization, applied AFTER the trigger is stamped (see Part 1/2).\n"
+        "normalize = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)\n"
+        "\n"
+        "# [0,1]-space transforms: identical to the clean notebook MINUS the trailing Normalize.\n"
+        "train_transform_01 = transforms.Compose([\n"
+        "    transforms.Resize((224, 224)),\n"
+        "    transforms.RandomRotation(15),\n"
+        "    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),\n"
+        "    transforms.ToTensor(),\n"
+        "])\n"
+        "val_test_transform_01 = transforms.Compose([\n"
+        "    transforms.Resize((224, 224)),\n"
+        "    transforms.ToTensor(),\n"
+        "])\n"
+        "\n"
+        "# De-normalize helper (for visualization / metrics that need [0,1]).\n"
+        "inv_normalize = transforms.Normalize(\n"
+        "    mean=[-m/s for m, s in zip(IMAGENET_MEAN, IMAGENET_STD)],\n"
+        "    std=[1/s for s in IMAGENET_STD]\n"
+        ")\n"
+        "print('Transforms defined (trigger lives in [0,1] pixel space, normalize applied last).')"
+    ))
+
+    # ── Datasets (reused: NumericImageFolder + GTSRBTestDataset) ──────────────
+    cells.append(md(
+        "## Datasets — reused `NumericImageFolder` / `GTSRBTestDataset`\n"
+        "Same correct integer label mapping (`'10' -> 10`, matching `Test.csv` ClassId) and same "
+        "80/20 train/val split (seed=42) as the clean training notebooks. The only change: these "
+        "carry the **`[0,1]`-space** transforms (normalize is added later by the wrappers)."
+    ))
+    cells.append(code(
+        "class NumericImageFolder(torchvision.datasets.ImageFolder):\n"
+        "    \"\"\"ImageFolder that sorts class folders by integer value, not alphabetically.\n"
+        "    Default alphabetical sort maps folder '10' -> index 2 instead of 10,\n"
+        "    which misaligns with the integer ClassId values in Test.csv.\"\"\"\n"
+        "    def find_classes(self, directory):\n"
+        "        classes = sorted(os.listdir(directory), key=lambda x: int(x))\n"
+        "        class_to_idx = {cls: int(cls) for cls in classes}\n"
+        "        return classes, class_to_idx\n"
+        "\n"
+        "\n"
+        "class GTSRBTestDataset(Dataset):\n"
+        "    def __init__(self, csv_path, root_dir, transform=None):\n"
+        "        self.df = pd.read_csv(csv_path)\n"
+        "        self.root_dir = root_dir\n"
+        "        self.transform = transform\n"
+        "\n"
+        "    def __len__(self):\n"
+        "        return len(self.df)\n"
+        "\n"
+        "    def __getitem__(self, idx):\n"
+        "        row = self.df.iloc[idx]\n"
+        "        img_path = os.path.join(self.root_dir, row['Path'])\n"
+        "        image = Image.open(img_path).convert('RGB')\n"
+        "        label = int(row['ClassId'])\n"
+        "        if self.transform:\n"
+        "            image = self.transform(image)\n"
+        "        return image, label\n"
+        "\n"
+        "\n"
+        "full_train_dataset = NumericImageFolder(TRAIN_DIR, transform=train_transform_01)\n"
+        "assert full_train_dataset.class_to_idx['10'] == 10, 'Label mapping is wrong!'\n"
+        "print(f\"Label mapping check passed: class '10' -> index {full_train_dataset.class_to_idx['10']}\")\n"
+        "\n"
+        "n_total = len(full_train_dataset)\n"
+        "n_val   = int(n_total * VAL_SPLIT)\n"
+        "n_train = n_total - n_val\n"
+        "train_split, val_split = random_split(\n"
+        "    full_train_dataset, [n_train, n_val],\n"
+        "    generator=torch.Generator().manual_seed(SEED)\n"
+        ")\n"
+        "# Val split uses the no-augmentation [0,1] transform (deterministic, like the clean notebook).\n"
+        "val_split.dataset = NumericImageFolder(TRAIN_DIR, transform=val_test_transform_01)\n"
+        "\n"
+        "test_split = GTSRBTestDataset(TEST_CSV, TEST_DIR, transform=val_test_transform_01)\n"
+        "\n"
+        "print(f'Train: {n_train} | Val: {n_val} | Test: {len(test_split)}')\n"
+        "print('NOTE: poison rates are applied to the {} training images (the 80% split that is '\n"
+        "      'actually trained on), matching the clean notebooks. The val split stays clean for '\n"
+        "      'honest checkpoint selection.'.format(n_train))"
+    ))
+
+    # ── Part 1: apply_trigger ─────────────────────────────────────────────────
+    cells.append(md(
+        "## Part 1 — Trigger function (the BadNets patch)\n"
+        "Classic BadNets: a fixed, high-contrast **white checkerboard** patch (alternating 0/1 in "
+        "`[0,1]` space) stamped in a corner. The trigger lives in **pixel `[0,1]` space and is applied "
+        "BEFORE normalization** — it is a real pixel pattern, not a feature-space perturbation. "
+        "Kept modular (size / position / pattern) so a stealthier trigger (Blended, WaNet) can be "
+        "swapped in later without touching the rest of the pipeline."
+    ))
+    cells.append(code(
+        "def make_trigger_patch(size, pattern='checkerboard'):\n"
+        "    \"\"\"Return a (3, size, size) trigger patch in [0,1] space.\n"
+        "    'checkerboard' = classic high-contrast BadNets patch (alternating 0 and 1).\n"
+        "    Add new patterns here (e.g. 'blended', 'wanet') for future stealthier triggers.\"\"\"\n"
+        "    if pattern == 'checkerboard':\n"
+        "        yy, xx = torch.meshgrid(torch.arange(size), torch.arange(size), indexing='ij')\n"
+        "        board = ((xx + yy) % 2).float()        # 0/1 checkerboard, per-pixel high contrast\n"
+        "        return board.unsqueeze(0).repeat(3, 1, 1)   # same pattern on R,G,B -> white/black\n"
+        "    raise ValueError(f'Unknown trigger pattern: {pattern}')\n"
+        "\n"
+        "\n"
+        "def apply_trigger(img, size=None, pos=None, pattern=None):\n"
+        "    \"\"\"Stamp a fixed trigger patch onto a [0,1] CHW image tensor (PIXEL SPACE, BEFORE\n"
+        "    normalization). Returns a new tensor; does not mutate the input.\n"
+        "    Configurable via TRIGGER_SIZE / TRIGGER_POS / TRIGGER_PATTERN (cell 0) or per-call args.\"\"\"\n"
+        "    size    = TRIGGER_SIZE    if size    is None else size\n"
+        "    pos     = TRIGGER_POS     if pos     is None else pos\n"
+        "    pattern = TRIGGER_PATTERN if pattern is None else pattern\n"
+        "    img = img.clone()\n"
+        "    C, H, W = img.shape\n"
+        "    patch = make_trigger_patch(size, pattern).to(img.dtype)\n"
+        "    if   pos == 'bottom_right': y0, x0 = H - size, W - size\n"
+        "    elif pos == 'bottom_left':  y0, x0 = H - size, 0\n"
+        "    elif pos == 'top_right':    y0, x0 = 0,        W - size\n"
+        "    elif pos == 'top_left':     y0, x0 = 0,        0\n"
+        "    else: raise ValueError(f'Unknown trigger position: {pos}')\n"
+        "    img[:, y0:y0+size, x0:x0+size] = patch\n"
+        "    return img\n"
+        "\n"
+        "# Quick sanity preview of the trigger on one test image.\n"
+        "_img0, _ = test_split[0]\n"
+        "_trig0 = apply_trigger(_img0)\n"
+        "fig, ax = plt.subplots(1, 2, figsize=(6, 3))\n"
+        "ax[0].imshow(_img0.permute(1, 2, 0).numpy());  ax[0].set_title('clean [0,1]'); ax[0].axis('off')\n"
+        "ax[1].imshow(_trig0.permute(1, 2, 0).numpy()); ax[1].set_title(f'+ trigger ({TRIGGER_SIZE}px {TRIGGER_POS})'); ax[1].axis('off')\n"
+        "plt.tight_layout(); plt.show()\n"
+        "print('apply_trigger ready — trigger stamped in [0,1] pixel space, normalize applied afterward.')"
+    ))
+
+    # ── Part 2: PoisonedDataset ───────────────────────────────────────────────
+    cells.append(md(
+        "## Part 2 — Poisoned training dataset\n"
+        "`PoisonedDataset` wraps the clean `[0,1]`-space training split. A fixed random `p`-fraction "
+        "of indices (seed=42) get the trigger stamped **and** are relabeled to `TARGET_LABEL`; the "
+        "rest pass through clean. Every sample is ImageNet-normalized last. Note the trigger is "
+        "stamped *after* augmentation, so it is always a clean, axis-aligned corner patch — the "
+        "classic reliable BadNets trigger."
+    ))
+    cells.append(code(
+        "class PoisonedDataset(Dataset):\n"
+        "    \"\"\"Wrap a clean [0,1]-space dataset. A reproducible p-fraction of samples get the\n"
+        "    trigger stamped (in [0,1] space) AND relabeled to target_label; rest stay clean.\n"
+        "    All samples are normalized last so the model receives ImageNet-normalized tensors.\"\"\"\n"
+        "    def __init__(self, base_dataset, poison_rate, target_label=TARGET_LABEL,\n"
+        "                 normalize_tf=None, seed=SEED, verbose=True):\n"
+        "        self.base = base_dataset\n"
+        "        self.target_label = target_label\n"
+        "        self.normalize = normalize if normalize_tf is None else normalize_tf\n"
+        "        n = len(base_dataset)\n"
+        "        n_poison = int(round(poison_rate * n))\n"
+        "        g = torch.Generator().manual_seed(seed)\n"
+        "        perm = torch.randperm(n, generator=g)\n"
+        "        self.poison_idx = set(perm[:n_poison].tolist())\n"
+        "        self.n_poison = n_poison\n"
+        "        if verbose:\n"
+        "            print(f'Poisoned {n_poison} / {n} training images ({poison_rate*100:.1f}%)')\n"
+        "\n"
+        "    def __len__(self):\n"
+        "        return len(self.base)\n"
+        "\n"
+        "    def __getitem__(self, idx):\n"
+        "        img, label = self.base[idx]        # img is a [0,1] CHW tensor\n"
+        "        if idx in self.poison_idx:\n"
+        "            img = apply_trigger(img)       # stamp trigger in [0,1] pixel space\n"
+        "            label = self.target_label      # relabel to the attacker's target class\n"
+        "        img = self.normalize(img)          # normalize last -> what the model sees\n"
+        "        return img, label\n"
+        "\n"
+        "\n"
+        "class NormalizedTestDataset(Dataset):\n"
+        "    \"\"\"Clean test wrapper: optionally stamp the trigger on EVERY image, then normalize.\n"
+        "    trigger=False -> clean test set (for CA); trigger=True -> fully-triggered set (for ASR).\"\"\"\n"
+        "    def __init__(self, base_dataset, trigger=False, normalize_tf=None):\n"
+        "        self.base = base_dataset\n"
+        "        self.trigger = trigger\n"
+        "        self.normalize = normalize if normalize_tf is None else normalize_tf\n"
+        "\n"
+        "    def __len__(self):\n"
+        "        return len(self.base)\n"
+        "\n"
+        "    def __getitem__(self, idx):\n"
+        "        img, label = self.base[idx]\n"
+        "        if self.trigger:\n"
+        "            img = apply_trigger(img)\n"
+        "        return self.normalize(img), label\n"
+        "\n"
+        "# Clean + fully-triggered test loaders (built once; reused for every checkpoint).\n"
+        "clean_test_loader = DataLoader(NormalizedTestDataset(test_split, trigger=False),\n"
+        "                               batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)\n"
+        "trig_test_loader  = DataLoader(NormalizedTestDataset(test_split, trigger=True),\n"
+        "                               batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)\n"
+        "# Clean val loader (un-poisoned) for honest best-checkpoint selection during training.\n"
+        "val_loader = DataLoader(NormalizedTestDataset(val_split, trigger=False),\n"
+        "                        batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)\n"
+        "print('PoisonedDataset + test/val loaders ready.')"
+    ))
+
+    # ── Model builders ────────────────────────────────────────────────────────
+    cells.append(md(
+        f"## Model — {cfg['title']} (same architecture / freezing / discriminative LRs as the clean notebook)\n"
+        "`build_model()` and `build_optimizer()` are factored into functions so we can train a "
+        "**fresh model from scratch** for each poison rate (genuine BadNets behavior — we never "
+        "fine-tune from a clean checkpoint). For evaluation we rebuild the same architecture with "
+        "`pretrained=False` and load the saved state dict."
+    ))
+    cells.append(code(cfg['build_src'] + "\n\nprint('build_model / build_optimizer ready.')"))
+
+    # ── Part 3: training over poison rates ───────────────────────────────────
+    cells.append(md(
+        "## Part 3 — Train from scratch for each poison rate\n"
+        "For every rate in `POISON_RATES` we build the poisoned training set, train a fresh model "
+        "for the model's full epoch count (best-clean-val checkpoint saved as "
+        "`badnets_{model}_p{rate}.pth`), and print per-epoch progress.\n"
+        "\n"
+        "**⚠ Compute-heavy:** this is 5 full trainings (one per rate, including the clean baseline). "
+        "`torch.manual_seed(SEED)` is reset before each rate so model init + data ordering are "
+        "identical across rates — the only thing that changes is the poison fraction."
+    ))
+    cells.append(code(
+        "def train_one_rate(poison_rate):\n"
+        "    torch.manual_seed(SEED)   # identical init + shuffling order across rates\n"
+        "    np.random.seed(SEED); random.seed(SEED)\n"
+        "    poisoned_train = PoisonedDataset(train_split, poison_rate)\n"
+        "    train_loader = DataLoader(poisoned_train, batch_size=BATCH_SIZE, shuffle=True,\n"
+        "                              num_workers=0, pin_memory=True)\n"
+        "    model = build_model(pretrained=True)\n"
+        "    optimizer = build_optimizer(model)\n"
+        "    scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)\n"
+        "    criterion = nn.CrossEntropyLoss()\n"
+        "    ckpt = f'badnets_{MODEL_NAME}_p{poison_rate}.pth'\n"
+        "    best_val_acc = 0.0\n"
+        "    for epoch in range(1, NUM_EPOCHS + 1):\n"
+        "        model.train()\n"
+        "        run_loss, correct, total = 0.0, 0, 0\n"
+        "        for imgs, labels in train_loader:\n"
+        "            imgs, labels = imgs.to(device), labels.to(device)\n"
+        "            optimizer.zero_grad()\n"
+        "            outputs = model(imgs)\n"
+        "            loss = criterion(outputs, labels)\n"
+        "            loss.backward()\n"
+        "            optimizer.step()\n"
+        "            run_loss += loss.item() * imgs.size(0)\n"
+        "            correct += (outputs.argmax(1) == labels).sum().item()\n"
+        "            total += imgs.size(0)\n"
+        "        train_loss, train_acc = run_loss / total, correct / total\n"
+        "\n"
+        "        model.eval()\n"
+        "        run_loss, correct, total = 0.0, 0, 0\n"
+        "        with torch.no_grad():\n"
+        "            for imgs, labels in val_loader:\n"
+        "                imgs, labels = imgs.to(device), labels.to(device)\n"
+        "                outputs = model(imgs)\n"
+        "                loss = criterion(outputs, labels)\n"
+        "                run_loss += loss.item() * imgs.size(0)\n"
+        "                correct += (outputs.argmax(1) == labels).sum().item()\n"
+        "                total += imgs.size(0)\n"
+        "        val_loss, val_acc = run_loss / total, correct / total\n"
+        "        scheduler.step()\n"
+        "        saved = val_acc > best_val_acc\n"
+        "        if saved:\n"
+        "            best_val_acc = val_acc\n"
+        "            torch.save(model.state_dict(), ckpt)\n"
+        "        print(f'  [p={poison_rate*100:>4.1f}%] Epoch {epoch:02d}/{NUM_EPOCHS} | '\n"
+        "              f'Train Loss {train_loss:.4f} Acc {train_acc:.4f} | '\n"
+        "              f'Val(clean) Loss {val_loss:.4f} Acc {val_acc:.4f}'\n"
+        "              + (' *** saved' if saved else ''))\n"
+        "    print(f'  -> best clean-val acc {best_val_acc:.4f}, saved {ckpt}')\n"
+        "    return ckpt\n"
+        "\n"
+        "checkpoints = {}\n"
+        "for rate in POISON_RATES:\n"
+        "    print(f'\\n===== Training poison rate {rate*100:.0f}% =====')\n"
+        "    checkpoints[rate] = train_one_rate(rate)\n"
+        "print('\\nAll trainings done:', checkpoints)"
+    ))
+
+    # ── Part 4: evaluation (CA + ASR) ────────────────────────────────────────
+    cells.append(md(
+        "## Part 4 — Evaluation: Clean Accuracy (CA) and Attack Success Rate (ASR)\n"
+        "- **CA**: accuracy on the clean (un-triggered) test set.\n"
+        "- **ASR**: apply the trigger to *every* test image, measure the fraction predicted as "
+        "`TARGET_LABEL`. **Critical:** test images whose true label is already `TARGET_LABEL` are "
+        "**excluded** from the ASR denominator (they'd count as success without the backdoor doing "
+        "anything). `ASR = (non-target images predicted target) / (non-target test images)`."
+    ))
+    cells.append(code(
+        "@torch.no_grad()\n"
+        "def evaluate_checkpoint(ckpt):\n"
+        "    model = build_model(pretrained=False)\n"
+        "    model.load_state_dict(torch.load(ckpt, map_location=device))\n"
+        "    model.eval()\n"
+        "    # Clean Accuracy\n"
+        "    correct, total = 0, 0\n"
+        "    for imgs, labels in clean_test_loader:\n"
+        "        imgs, labels = imgs.to(device), labels.to(device)\n"
+        "        preds = model(imgs).argmax(1)\n"
+        "        correct += (preds == labels).sum().item()\n"
+        "        total += labels.size(0)\n"
+        "    clean_acc = correct / total\n"
+        "    # Attack Success Rate (exclude true-target images from denominator)\n"
+        "    hit, denom = 0, 0\n"
+        "    for imgs, labels in trig_test_loader:\n"
+        "        imgs, labels = imgs.to(device), labels.to(device)\n"
+        "        preds = model(imgs).argmax(1)\n"
+        "        nontarget = labels != TARGET_LABEL\n"
+        "        hit   += ((preds == TARGET_LABEL) & nontarget).sum().item()\n"
+        "        denom += nontarget.sum().item()\n"
+        "    asr = hit / denom\n"
+        "    return clean_acc, asr\n"
+        "\n"
+        "# Reload checkpoints from disk if not in memory (lets eval run without retraining).\n"
+        "if 'checkpoints' not in dir():\n"
+        "    checkpoints = {r: f'badnets_{MODEL_NAME}_p{r}.pth' for r in POISON_RATES}\n"
+        "\n"
+        "results = {}\n"
+        "for rate in POISON_RATES:\n"
+        "    ca, asr = evaluate_checkpoint(checkpoints[rate])\n"
+        "    results[rate] = {'clean_acc': ca, 'asr': asr}\n"
+        "    print(f'p={rate*100:>4.1f}%  CA={ca*100:6.2f}%  ASR={asr*100:6.2f}%')"
+    ))
+
+    # ── results table ─────────────────────────────────────────────────────────
+    cells.append(md("### Results table"))
+    cells.append(code(
+        "baseline_ca = results[0.0]['clean_acc']\n"
+        "print(f'{MODEL_TITLE} — BadNets on GTSRB (target class {TARGET_LABEL}, '\n"
+        "      f'{TRIGGER_SIZE}px {TRIGGER_PATTERN} {TRIGGER_POS} trigger)')\n"
+        "print()\n"
+        "print('Poison Rate | Clean Acc | ASR    | Clean Acc Drop')\n"
+        "print('------------|-----------|--------|---------------')\n"
+        "for rate in POISON_RATES:\n"
+        "    ca  = results[rate]['clean_acc'] * 100\n"
+        "    asr = results[rate]['asr'] * 100\n"
+        "    if rate == 0.0:\n"
+        "        label = '0%  (clean)'\n"
+        "        drop_str = 'baseline'\n"
+        "    else:\n"
+        "        label = f'{rate*100:.0f}%'.ljust(11)\n"
+        "        drop = (baseline_ca - results[rate]['clean_acc']) * 100\n"
+        "        drop_str = f'-{drop:.2f} pp' if drop >= 0 else f'+{-drop:.2f} pp'\n"
+        "    print(f'{label:<11} | {ca:6.2f}%   | {asr:6.2f}% | {drop_str}')"
+    ))
+
+    # ── Part 5: sweep plot ────────────────────────────────────────────────────
+    cells.append(md(
+        "## Part 5 — ASR & Clean Accuracy vs poison rate\n"
+        "The story: **ASR rises sharply** with poison rate while **clean accuracy stays flat** "
+        "(the backdoor is stealthy). Saved as `{model}_badnets_sweep.png`."
+    ))
+    cells.append(code(
+        "rates_pct = [r * 100 for r in POISON_RATES]\n"
+        "ca_pct  = [results[r]['clean_acc'] * 100 for r in POISON_RATES]\n"
+        "asr_pct = [results[r]['asr'] * 100 for r in POISON_RATES]\n"
+        "\n"
+        "fig, ax1 = plt.subplots(figsize=(8, 5))\n"
+        "color_asr, color_ca = 'crimson', 'steelblue'\n"
+        "ax1.plot(rates_pct, asr_pct, 'o-', color=color_asr, linewidth=2, markersize=7, label='ASR')\n"
+        "ax1.set_xlabel('Poison rate (%)')\n"
+        "ax1.set_ylabel('Attack Success Rate (%)', color=color_asr)\n"
+        "ax1.tick_params(axis='y', labelcolor=color_asr)\n"
+        "ax1.set_ylim(-3, 103)\n"
+        "ax1.axhline(95, color=color_asr, linestyle=':', alpha=0.5, label='95% ASR')\n"
+        "\n"
+        "ax2 = ax1.twinx()\n"
+        "ax2.plot(rates_pct, ca_pct, 's-', color=color_ca, linewidth=2, markersize=7, label='Clean Acc')\n"
+        "ax2.set_ylabel('Clean Accuracy (%)', color=color_ca)\n"
+        "ax2.tick_params(axis='y', labelcolor=color_ca)\n"
+        "_lo = min(ca_pct) - 2\n"
+        "ax2.set_ylim(min(_lo, baseline_ca*100 - 5), 100.5)\n"
+        "\n"
+        "lines1, labels1 = ax1.get_legend_handles_labels()\n"
+        "lines2, labels2 = ax2.get_legend_handles_labels()\n"
+        "ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')\n"
+        "plt.title(f'{MODEL_TITLE} — BadNets: ASR vs Clean Accuracy across poison rate (GTSRB)')\n"
+        "ax1.grid(True, alpha=0.3)\n"
+        "plt.tight_layout()\n"
+        "plt.savefig(f'{MODEL_NAME}_badnets_sweep.png', dpi=150, bbox_inches='tight')\n"
+        "plt.show()\n"
+        "print(f'Saved {MODEL_NAME}_badnets_sweep.png')"
+    ))
+
+    # ── Part 6: visualization ─────────────────────────────────────────────────
+    cells.append(md(
+        "## Part 6 — Clean vs triggered visualization\n"
+        "5 examples: **clean image** (clean-model prediction) vs **triggered image** (clean-model "
+        "prediction → backdoored-model prediction). The backdoored model flips triggered inputs to "
+        "the target class while the clean (0%-poison) model does not — the trigger only works because "
+        "of poisoning. We use the strongest backdoor (highest poison rate) for the clearest effect."
+    ))
+    cells.append(code(
+        "clean_ckpt    = checkpoints[0.0]                 # 0% poison = clean control model\n"
+        "backdoor_rate = max(POISON_RATES)                # strongest backdoor for a clear demo\n"
+        "backdoor_ckpt = checkpoints[backdoor_rate]\n"
+        "\n"
+        "clean_model = build_model(pretrained=False)\n"
+        "clean_model.load_state_dict(torch.load(clean_ckpt, map_location=device)); clean_model.eval()\n"
+        "bd_model = build_model(pretrained=False)\n"
+        "bd_model.load_state_dict(torch.load(backdoor_ckpt, map_location=device)); bd_model.eval()\n"
+        "\n"
+        "# Pick 5 non-target test images so the flip-to-target is meaningful.\n"
+        "rng = random.Random(SEED)\n"
+        "cand = [i for i in range(len(test_split)) if test_split[i][1] != TARGET_LABEL]\n"
+        "show_idx = rng.sample(cand, 5)\n"
+        "\n"
+        "fig, axes = plt.subplots(5, 2, figsize=(6, 15))\n"
+        "with torch.no_grad():\n"
+        "    for row, idx in enumerate(show_idx):\n"
+        "        img01, true_label = test_split[idx]\n"
+        "        trig01 = apply_trigger(img01)\n"
+        "        clean_in = normalize(img01).unsqueeze(0).to(device)\n"
+        "        trig_in  = normalize(trig01).unsqueeze(0).to(device)\n"
+        "        clean_pred_on_clean = clean_model(clean_in).argmax(1).item()\n"
+        "        clean_pred_on_trig  = clean_model(trig_in).argmax(1).item()\n"
+        "        bd_pred_on_trig     = bd_model(trig_in).argmax(1).item()\n"
+        "        axes[row, 0].imshow(img01.permute(1, 2, 0).numpy())\n"
+        "        axes[row, 0].set_title(f'CLEAN  true={true_label}\\nclean-model pred={clean_pred_on_clean}', fontsize=9)\n"
+        "        axes[row, 0].axis('off')\n"
+        "        flipped = bd_pred_on_trig == TARGET_LABEL\n"
+        "        axes[row, 1].imshow(trig01.permute(1, 2, 0).numpy())\n"
+        "        axes[row, 1].set_title(\n"
+        "            f'TRIGGERED  true={true_label}\\nclean-model={clean_pred_on_trig} | '\n"
+        "            f'backdoor={bd_pred_on_trig}' + (' (=TARGET!)' if flipped else ''),\n"
+        "            fontsize=9, color=('crimson' if flipped else 'black'))\n"
+        "        axes[row, 1].axis('off')\n"
+        "plt.suptitle(f'{MODEL_TITLE} — clean vs triggered (backdoor trained at p={backdoor_rate*100:.0f}%)', fontsize=12)\n"
+        "plt.tight_layout()\n"
+        "plt.show()"
+    ))
+
+    # ── Part 7: imperceptibility ──────────────────────────────────────────────
+    cells.append(md(
+        "## Part 7 — Trigger imperceptibility (PSNR / SSIM / LPIPS)\n"
+        "Same perceptual metrics used in the evasion-attack notebooks, here between **clean and "
+        "triggered** test images (computed in `[0,1]` pixel space, where the trigger lives). "
+        "**The classic BadNets checkerboard patch scores poorly on purpose** — BadNets is a *visible* "
+        "trigger. This is the baseline that stealthier triggers (Blended, WaNet) will improve on in "
+        "future work. Reference imperceptibility thresholds: PSNR > 30 dB, SSIM > 0.95, LPIPS < 0.1."
+    ))
+    cells.append(code(
+        "import subprocess, sys, math\n"
+        "subprocess.run([sys.executable, '-m', 'pip', 'install', 'lpips', 'scikit-image', '-q'], check=True)\n"
+        "import lpips\n"
+        "from skimage.metrics import structural_similarity as ssim_fn\n"
+        "\n"
+        "METRIC_N = 500   # number of test images to measure over\n"
+        "lpips_fn = lpips.LPIPS(net='alex').to(device)\n"
+        "\n"
+        "def _psnr01(a, b):\n"
+        "    mse = ((a - b) ** 2).mean()\n"
+        "    return 10 * math.log10(1.0 / mse) if mse > 0 else float('inf')\n"
+        "\n"
+        "psnrs, ssims, lpips_vals = [], [], []\n"
+        "rng = random.Random(SEED)\n"
+        "metric_idx = rng.sample(range(len(test_split)), min(METRIC_N, len(test_split)))\n"
+        "with torch.no_grad():\n"
+        "    for idx in metric_idx:\n"
+        "        img01, _ = test_split[idx]                 # [0,1] CHW\n"
+        "        trig01 = apply_trigger(img01)\n"
+        "        o = img01.permute(1, 2, 0).numpy()\n"
+        "        a = trig01.permute(1, 2, 0).numpy()\n"
+        "        psnrs.append(_psnr01(o, a))\n"
+        "        ssims.append(ssim_fn(o, a, channel_axis=2, data_range=1.0))\n"
+        "        # LPIPS expects [-1,1]\n"
+        "        o11 = (img01.unsqueeze(0).to(device)  * 2 - 1)\n"
+        "        a11 = (trig01.unsqueeze(0).to(device) * 2 - 1)\n"
+        "        lpips_vals.append(lpips_fn(o11, a11).item())\n"
+        "\n"
+        "finite_psnr = [p for p in psnrs if math.isfinite(p)]\n"
+        "psnr_mean = float(np.mean(finite_psnr)); psnr_std = float(np.std(finite_psnr))\n"
+        "ssim_mean = float(np.mean(ssims));       ssim_std = float(np.std(ssims))\n"
+        "lpips_mean = float(np.mean(lpips_vals)); lpips_std = float(np.std(lpips_vals))\n"
+        "\n"
+        "print(f'Trigger imperceptibility over N={len(metric_idx)} clean-vs-triggered pairs '\n"
+        "      f'({TRIGGER_SIZE}px {TRIGGER_PATTERN} {TRIGGER_POS}):')\n"
+        "print(f'  PSNR  = {psnr_mean:6.2f} +/- {psnr_std:.2f} dB   (imperceptible if > 30)')\n"
+        "print(f'  SSIM  = {ssim_mean:6.4f} +/- {ssim_std:.4f}      (imperceptible if > 0.95)')\n"
+        "print(f'  LPIPS = {lpips_mean:6.4f} +/- {lpips_std:.4f}      (imperceptible if < 0.1)')\n"
+        "print()\n"
+        "print('As expected, the classic BadNets patch is VISIBLE (fails imperceptibility thresholds).')\n"
+        "print('This is the intended baseline; stealthier triggers (Blended/WaNet) are future work.')\n"
+        "imperceptibility = {'psnr_mean': psnr_mean, 'psnr_std': psnr_std,\n"
+        "                    'ssim_mean': ssim_mean, 'ssim_std': ssim_std,\n"
+        "                    'lpips_mean': lpips_mean, 'lpips_std': lpips_std, 'n': len(metric_idx)}"
+    ))
+
+    # ── Part 8: summary + json ────────────────────────────────────────────────
+    cells.append(md(
+        "## Part 8 — Summary headline + JSON dump\n"
+        "Minimum poison rate achieving **≥95% ASR** while keeping **clean-accuracy drop < 2 pp**. "
+        "Results saved to `badnets_{model}_gtsrb.json` for later cross-model aggregation."
+    ))
+    cells.append(code(
+        "ASR_TARGET = 0.95\n"
+        "CA_DROP_MAX = 0.02   # 2 pp\n"
+        "\n"
+        "qualifying = []\n"
+        "for rate in POISON_RATES:\n"
+        "    if rate == 0.0:\n"
+        "        continue\n"
+        "    asr  = results[rate]['asr']\n"
+        "    drop = baseline_ca - results[rate]['clean_acc']\n"
+        "    if asr >= ASR_TARGET and drop < CA_DROP_MAX:\n"
+        "        qualifying.append(rate)\n"
+        "\n"
+        "if qualifying:\n"
+        "    best_rate = min(qualifying)\n"
+        "    asr_at = results[best_rate]['asr'] * 100\n"
+        "    drop_at = (baseline_ca - results[best_rate]['clean_acc']) * 100\n"
+        "    headline = (f'BadNets achieves {asr_at:.1f}% ASR at just {best_rate*100:.0f}% poisoning '\n"
+        "                f'with negligible clean-accuracy cost ({drop_at:+.2f} pp) on {MODEL_TITLE}.')\n"
+        "else:\n"
+        "    best_rate = None\n"
+        "    # Report the best ASR achieved within the CA-drop budget, else overall best ASR.\n"
+        "    within = [(results[r]['asr'], r) for r in POISON_RATES if r != 0.0\n"
+        "              and (baseline_ca - results[r]['clean_acc']) < CA_DROP_MAX]\n"
+        "    pool = within if within else [(results[r]['asr'], r) for r in POISON_RATES if r != 0.0]\n"
+        "    top_asr, top_rate = max(pool)\n"
+        "    headline = (f'No poison rate hit >=95% ASR within a <2pp clean-accuracy drop on {MODEL_TITLE}; '\n"
+        "                f'best was {top_asr*100:.1f}% ASR at {top_rate*100:.0f}% poisoning.')\n"
+        "\n"
+        "print('=' * 80)\n"
+        "print('HEADLINE:', headline)\n"
+        "print('=' * 80)\n"
+        "print(f'Control check — ASR at 0% poisoning (no backdoor): {results[0.0][\"asr\"]*100:.2f}% '\n"
+        "      f'(should be near-chance; confirms the patch alone does not trigger the target class).')\n"
+        "\n"
+        "out = {\n"
+        "    'model': MODEL_NAME,\n"
+        "    'dataset': 'gtsrb',\n"
+        "    'attack': 'badnets',\n"
+        "    'target_label': TARGET_LABEL,\n"
+        "    'trigger': {'size': TRIGGER_SIZE, 'pos': TRIGGER_POS, 'pattern': TRIGGER_PATTERN,\n"
+        "                'space': '[0,1] pixel space, applied before normalization'},\n"
+        "    'num_epochs': NUM_EPOCHS,\n"
+        "    'batch_size': BATCH_SIZE,\n"
+        "    'seed': SEED,\n"
+        "    'poison_rates': list(POISON_RATES),\n"
+        "    'clean_acc': [results[r]['clean_acc'] for r in POISON_RATES],\n"
+        "    'asr': [results[r]['asr'] for r in POISON_RATES],\n"
+        "    'clean_acc_drop': [baseline_ca - results[r]['clean_acc'] for r in POISON_RATES],\n"
+        "    'baseline_clean_acc': baseline_ca,\n"
+        "    'min_rate_95asr_2pp': best_rate,\n"
+        "    'headline': headline,\n"
+        "    'imperceptibility': imperceptibility,\n"
+        "}\n"
+        "json_path = f'badnets_{MODEL_NAME}_gtsrb.json'\n"
+        "with open(json_path, 'w') as f:\n"
+        "    json.dump(out, f, indent=2)\n"
+        "print(f'Saved {json_path}')"
+    ))
+
+    return cells
+
+
+def main():
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gtsrb')
+    for model_key, cfg in CONFIGS.items():
+        global _id
+        _id = 0
+        cells = build_cells(model_key, cfg)
+        path = os.path.join(out_dir, cfg['nb_name'])
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(nb(cells), f, indent=1)
+        print(f'Wrote {path}  ({len(cells)} cells)')
+
+
+if __name__ == '__main__':
+    main()
