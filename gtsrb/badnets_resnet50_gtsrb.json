@@ -1,0 +1,55 @@
+{
+  "model": "resnet50",
+  "dataset": "gtsrb",
+  "attack": "badnets",
+  "target_label": 0,
+  "trigger": {
+    "size": 24,
+    "pos": "bottom_right",
+    "pattern": "checkerboard",
+    "space": "[0,1] pixel space, applied before normalization"
+  },
+  "num_epochs": 15,
+  "batch_size": 64,
+  "seed": 42,
+  "poison_rates": [
+    0.0,
+    0.01,
+    0.05,
+    0.1,
+    0.2
+  ],
+  "clean_acc": [
+    0.9774346793349169,
+    0.9756136183689628,
+    0.9744259699129058,
+    0.9765637371338084,
+    0.9735550277117974
+  ],
+  "asr": [
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "clean_acc_drop": [
+    0.0,
+    0.0018210609659541355,
+    0.0030087094220111466,
+    0.0008709422011085044,
+    0.00387965162311954
+  ],
+  "baseline_clean_acc": 0.9774346793349169,
+  "min_rate_95asr_2pp": 0.01,
+  "headline": "BadNets achieves 100.0% ASR at just 1% poisoning with negligible clean-accuracy cost (+0.18 pp) on ResNet-50.",
+  "imperceptibility": {
+    "psnr_mean": 23.771927918847453,
+    "psnr_std": 0.7552625894962122,
+    "ssim_mean": 0.988011360168457,
+    "ssim_std": 0.00015004472516011447,
+    "lpips_mean": 0.028480784527026116,
+    "lpips_std": 0.011024218821114536,
+    "n": 500
+  }
+}
