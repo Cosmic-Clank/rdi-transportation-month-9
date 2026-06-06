@@ -1,23 +1,28 @@
-"""Generate three BadNets backdoor notebooks: {model}_badnets.ipynb (GTSRB).
+"""Generate BadNets backdoor notebooks for BOTH datasets:
+  GTSRB      -> gtsrb/{model}_badnets_gtsrb.ipynb    (NUM_CLASSES=43, CSV test set)
+  BelgiumTSC -> belgiumtsd/{model}_badnets_bel.ipynb (NUM_CLASSES=62, ImageFolder test set)
 
 Phase 1: validate the BadNets data-poisoning pipeline on ResNet-50, VGG-16 and
-MobileNetV3-Large. Each notebook is identical except for per-model config
-(architecture / layer freezing / discriminative LRs / batch size / epochs /
-checkpoint+output names), reused verbatim from the clean training notebooks
-(resnet.ipynb, vgg16.ipynb, mobilenetv3.ipynb).
+MobileNetV3-Large. Each notebook is identical except for per-(model,dataset) config
+(architecture / freezing / discriminative LRs / batch size / epochs / num classes /
+data loading / checkpoint+output names), reused from the clean training notebooks.
+
+The generated code cells are dataset-agnostic — dataset differences live in cell-0
+constants (DS_TITLE / DS_SHORT / CKPT_TAG / NUM_CLASSES / paths) and the dataset cell
+(loader class, label assert, test-set build). BelgiumTSC loading mirrors
+gen_combined_attack_notebooks.py (os.scandir NumericImageFolder + allow_empty test set).
 
 Pipeline per notebook:
   Part 1  apply_trigger()  — modular BadNets checkerboard patch in [0,1] pixel space
   Part 2  PoisonedDataset  — stamp trigger + relabel to TARGET_LABEL on a p-fraction
-  Part 3  train from scratch for each poison rate (0%,1%,5%,10%,20%)
+  Part 3  train from scratch for each (poison rate, seed)
   Part 4  evaluate Clean Accuracy (CA) and Attack Success Rate (ASR)
-  Part 5  ASR / CA vs poison-rate sweep plot
+  Part 5  ASR / CA vs poison-rate sweep plot (log-x, std error bars on multi-seed rates)
   Part 6  clean-vs-triggered visualization (clean-model vs backdoored-model preds)
-  Part 7  trigger imperceptibility (PSNR/SSIM/LPIPS) — reused from attack notebooks
+  Part 7  trigger perceptibility (PSNR/SSIM/LPIPS)
   Part 8  summary headline + JSON dump for cross-model aggregation
 
 Run:  python gen_badnets_notebooks.py
-Outputs the three .ipynb files into gtsrb/ (alongside the clean training notebooks).
 """
 import json, os
 
@@ -44,9 +49,9 @@ def nb(cells):
         "cells": cells,
     }
 
-# ── per-model build/optimizer source (reused verbatim from clean training notebooks) ──
+# ── per-model build/optimizer source (identical across datasets; ImageNet transfer) ──
 RESNET_BUILD = '''def build_model(pretrained=True):
-    """ResNet-50: freeze all but layer4 + fc (same as clean resnet.ipynb)."""
+    """ResNet-50: freeze all but layer4 + fc (same as clean training notebook)."""
     weights = ResNet50_Weights.DEFAULT if pretrained else None
     model = models.resnet50(weights=weights)
     for name, param in model.named_parameters():
@@ -64,7 +69,7 @@ def build_optimizer(model):
 
 VGG_BUILD = '''def build_model(pretrained=True):
     """VGG-16: freeze all, unfreeze conv blocks 4+5 (features[17:]) + full classifier
-    (same as clean vgg16.ipynb)."""
+    (same as clean training notebook)."""
     weights = VGG16_Weights.DEFAULT if pretrained else None
     model = models.vgg16(weights=weights)
     for param in model.parameters():
@@ -87,7 +92,7 @@ def build_optimizer(model):
 
 MOBILENET_BUILD = '''def build_model(pretrained=True):
     """MobileNetV3-Large: freeze all, unfreeze last 5 feature blocks (12:) + full
-    classifier (same as clean mobilenetv3.ipynb)."""
+    classifier (same as clean training notebook)."""
     weights = MobileNet_V3_Large_Weights.DEFAULT if pretrained else None
     model = models.mobilenet_v3_large(weights=weights)
     for param in model.parameters():
@@ -108,44 +113,160 @@ def build_optimizer(model):
         {'params': model.classifier[3].parameters(), 'lr': 5e-4},
     ])'''
 
-# ── per-model config ──────────────────────────────────────────────────────────
-# epochs/batch sizes match the clean training notebooks EXACTLY so the 0%-poison
-# baseline reproduces the original models' accuracy:
-#   ResNet    15 epochs, batch 64   (resnet.ipynb)
-#   VGG       20 epochs, batch 32   (vgg16.ipynb)
-#   MobileNet 20 epochs, batch 64   (mobilenetv3.ipynb)
-# T_max for the cosine schedule == NUM_EPOCHS per model (same as the clean notebooks).
-CONFIGS = {
-    'resnet50': dict(
-        nb_name='resnet_badnets.ipynb',
-        title='ResNet-50',
-        weights_import='from torchvision.models import ResNet50_Weights',
-        batch_size=64, num_epochs=15,
-        build_src=RESNET_BUILD,
-    ),
-    'vgg16': dict(
-        nb_name='vgg16_badnets.ipynb',
-        title='VGG-16',
-        weights_import='from torchvision.models import VGG16_Weights',
-        batch_size=32, num_epochs=20,
-        build_src=VGG_BUILD,
-    ),
-    'mobilenetv3': dict(
-        nb_name='mobilenetv3_badnets.ipynb',
-        title='MobileNetV3-Large',
-        weights_import='from torchvision.models import MobileNet_V3_Large_Weights',
-        batch_size=64, num_epochs=20,
-        build_src=MOBILENET_BUILD,
-    ),
+# ── per-model meta (shared across datasets) ──────────────────────────────────────
+# nb_stem = notebook filename stem (kept as the original badnets names; resnet -> 'resnet',
+# while MODEL_NAME stays 'resnet50' for checkpoint/json/png names to match prior runs).
+MODELS = {
+    'resnet50':    dict(title='ResNet-50',          nb_stem='resnet',      weights_import='from torchvision.models import ResNet50_Weights',          batch_size=64, build_src=RESNET_BUILD),
+    'vgg16':       dict(title='VGG-16',             nb_stem='vgg16',       weights_import='from torchvision.models import VGG16_Weights',             batch_size=32, build_src=VGG_BUILD),
+    'mobilenetv3': dict(title='MobileNetV3-Large',  nb_stem='mobilenetv3', weights_import='from torchvision.models import MobileNet_V3_Large_Weights', batch_size=64, build_src=MOBILENET_BUILD),
 }
 
+# ── dataset-specific source pieces ───────────────────────────────────────────────
+GTSRB_NUMERIC = (
+    "class NumericImageFolder(torchvision.datasets.ImageFolder):\n"
+    "    \"\"\"ImageFolder that sorts class folders by integer value, not alphabetically.\n"
+    "    Default alphabetical sort maps folder '10' -> index 2 instead of 10,\n"
+    "    which misaligns with the integer ClassId values in Test.csv.\"\"\"\n"
+    "    def find_classes(self, directory):\n"
+    "        classes = sorted(os.listdir(directory), key=lambda x: int(x))\n"
+    "        class_to_idx = {cls: int(cls) for cls in classes}\n"
+    "        return classes, class_to_idx\n"
+    "\n"
+    "\n"
+    "class GTSRBTestDataset(Dataset):\n"
+    "    def __init__(self, csv_path, root_dir, transform=None):\n"
+    "        self.df = pd.read_csv(csv_path)\n"
+    "        self.root_dir = root_dir\n"
+    "        self.transform = transform\n"
+    "    def __len__(self):\n"
+    "        return len(self.df)\n"
+    "    def __getitem__(self, idx):\n"
+    "        row = self.df.iloc[idx]\n"
+    "        img_path = os.path.join(self.root_dir, row['Path'])\n"
+    "        image = Image.open(img_path).convert('RGB')\n"
+    "        label = int(row['ClassId'])\n"
+    "        if self.transform:\n"
+    "            image = self.transform(image)\n"
+    "        return image, label\n"
+)
 
-def build_cells(model_key, cfg):
+# BelgiumTSC loader — reused verbatim from gen_combined_attack_notebooks.py (BEL_CLASS_DEF):
+# os.scandir + is_dir skips non-dir entries (Readme.txt) and sorts zero-padded names by int.
+BEL_NUMERIC = (
+    "class NumericImageFolder(torchvision.datasets.ImageFolder):\n"
+    "    \"\"\"Sorts class folders by integer value. BelgiumTSC folders are zero-padded\n"
+    "    '00000'..'00061'; os.scandir + is_dir skips non-directory entries (Readme.txt).\"\"\"\n"
+    "    def find_classes(self, directory):\n"
+    "        classes = sorted(\n"
+    "            (e.name for e in os.scandir(directory) if e.is_dir()),\n"
+    "            key=lambda x: int(x)\n"
+    "        )\n"
+    "        class_to_idx = {cls: int(cls) for cls in classes}\n"
+    "        return classes, class_to_idx\n"
+)
+
+GTSRB_LOAD = (
+    "\n"
+    "full_train_dataset = NumericImageFolder(TRAIN_DIR, transform=train_transform_01)\n"
+    "assert full_train_dataset.class_to_idx['10'] == 10, 'Label mapping is wrong!'\n"
+    "print(f\"Label mapping check passed: class '10' -> index {full_train_dataset.class_to_idx['10']}\")\n"
+    "\n"
+    "n_total = len(full_train_dataset)\n"
+    "n_val   = int(n_total * VAL_SPLIT)\n"
+    "n_train = n_total - n_val\n"
+    "train_split, val_split = random_split(\n"
+    "    full_train_dataset, [n_train, n_val],\n"
+    "    generator=torch.Generator().manual_seed(SEED)\n"
+    ")\n"
+    "# Val split uses the no-augmentation [0,1] transform (deterministic, like the clean notebook).\n"
+    "val_split.dataset = NumericImageFolder(TRAIN_DIR, transform=val_test_transform_01)\n"
+    "test_split = GTSRBTestDataset(TEST_CSV, TEST_DIR, transform=val_test_transform_01)\n"
+)
+
+BEL_LOAD = (
+    "\n"
+    "full_train_dataset = NumericImageFolder(TRAIN_DIR, transform=train_transform_01)\n"
+    "# Bel folders are zero-padded, so '10' is not a key — use the zero-padded key.\n"
+    "assert full_train_dataset.class_to_idx['00010'] == 10, 'Label mapping is wrong!'\n"
+    "print(f\"Label mapping check passed: class '00010' -> index {full_train_dataset.class_to_idx['00010']}\")\n"
+    "\n"
+    "n_total = len(full_train_dataset)\n"
+    "n_val   = int(n_total * VAL_SPLIT)\n"
+    "n_train = n_total - n_val\n"
+    "train_split, val_split = random_split(\n"
+    "    full_train_dataset, [n_train, n_val],\n"
+    "    generator=torch.Generator().manual_seed(SEED)\n"
+    ")\n"
+    "# Val split + test set use the bel NumericImageFolder with allow_empty=True (some class\n"
+    "# folders can be empty in a split / in Testing), mirroring the clean bel + combined notebooks.\n"
+    "val_split.dataset = NumericImageFolder(TRAIN_DIR, transform=val_test_transform_01, allow_empty=True)\n"
+    "test_split = NumericImageFolder(TEST_DIR, transform=val_test_transform_01, allow_empty=True)\n"
+)
+
+GTSRB_DATAVARS = (
+    "DATA_DIR   = 'dataset'\n"
+    "TRAIN_DIR  = os.path.join(DATA_DIR, 'Train')\n"
+    "TEST_CSV   = os.path.join(DATA_DIR, 'Test.csv')\n"
+    "TEST_DIR   = DATA_DIR\n"
+)
+
+BEL_DATAVARS = (
+    "DATA_DIR   = 'dataset'\n"
+    "# NOTE: confirm TRAIN_DIR matches your clean bel training notebook's actual path.\n"
+    "TRAIN_DIR  = os.path.join(DATA_DIR, 'BelgiumTSC_Training', 'Training')\n"
+    "TEST_DIR   = os.path.join(DATA_DIR, 'BelgiumTSC_Testing', 'Testing')\n"
+)
+
+GTSRB_DATASETS_MD = (
+    "## Datasets — reused `NumericImageFolder` / `GTSRBTestDataset`\n"
+    "Same correct integer label mapping (`'10' -> 10`, matching `Test.csv` ClassId) and same "
+    "80/20 train/val split (seed=42) as the clean training notebook. The only change: these "
+    "carry the **`[0,1]`-space** transforms (normalize is added later by the wrappers)."
+)
+
+BEL_DATASETS_MD = (
+    "## Datasets — reused bel `NumericImageFolder` (ImageFolder test set, no CSV)\n"
+    "Same loader as the clean bel training notebook: folders are zero-padded `'00000'..'00061'`, "
+    "so the mapping check uses `'00010' -> 10`. The test set is a **separate `Testing/` ImageFolder** "
+    "(not a CSV), loaded with `allow_empty=True`. Same 80/20 train/val split (seed=42) — on bel this "
+    "reproduces ~3660 train / ~915 val, with the separate Testing folder (~2520) as the clean test "
+    "set. These carry the **`[0,1]`-space** transforms (normalize is added later by the wrappers)."
+)
+
+DATASETS = {
+    'gtsrb': dict(ds_title='GTSRB', ds_short='gtsrb', ckpt_tag='', num_classes=43,
+                  out_subdir='gtsrb', nb_suffix='_badnets_gtsrb.ipynb',
+                  epochs=dict(resnet50=15, vgg16=20, mobilenetv3=20),
+                  numeric=GTSRB_NUMERIC, load=GTSRB_LOAD, datavars=GTSRB_DATAVARS,
+                  datasets_md=GTSRB_DATASETS_MD),
+    'bel':   dict(ds_title='BelgiumTSC', ds_short='bel', ckpt_tag='_bel', num_classes=62,
+                  out_subdir='belgiumtsd', nb_suffix='_badnets_bel.ipynb',
+                  epochs=dict(resnet50=30, vgg16=30, mobilenetv3=30),
+                  numeric=BEL_NUMERIC, load=BEL_LOAD, datavars=BEL_DATAVARS,
+                  datasets_md=BEL_DATASETS_MD),
+}
+
+# ── assemble (model x dataset) configs ──────────────────────────────────────────
+# epochs: GTSRB matches its clean notebooks (ResNet 15, VGG 20, MobileNet 20); BelgiumTSC
+# matches its clean notebooks (all 30). T_max for the cosine schedule == NUM_EPOCHS per model.
+CONFIGS = []
+for _ds_key, _ds in DATASETS.items():
+    for _mk, _m in MODELS.items():
+        _cfg = dict(model_key=_mk, num_epochs=_ds['epochs'][_mk])
+        _cfg.update(_m)
+        _cfg.update({k: v for k, v in _ds.items() if k != 'epochs'})
+        _cfg['nb_name'] = _cfg['nb_stem'] + _ds['nb_suffix']
+        CONFIGS.append(_cfg)
+
+
+def build_cells(cfg):
+    model_key = cfg['model_key']
     cells = []
 
     # ── Title / threat-model header ──────────────────────────────────────────
     cells.append(md(
-        f"# BadNets Backdoor Attack — {cfg['title']} (GTSRB)\n"
+        f"# BadNets Backdoor Attack — {cfg['title']} ({cfg['ds_title']})\n"
         "\n"
         "**Threat model: data-poisoning / supply-chain** (untrusted pretrained models or "
         "tampered datasets). An attacker who can inject a small fraction of poisoned samples "
@@ -181,7 +302,7 @@ def build_cells(model_key, cfg):
         "import matplotlib.pyplot as plt\n"
         "\n"
         "# ── BadNets configuration (cell 0) ──────────────────────────────────────\n"
-        "NUM_CLASSES   = 43\n"
+        f"NUM_CLASSES   = {cfg['num_classes']}\n"
         "TARGET_LABEL  = 0            # all-to-one: triggered images -> class 0 (configurable)\n"
         "POISON_RATES  = [0.0, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.05, 0.10, 0.20]   # 0.0 = clean baseline / control\n"
         "TRIGGER_SIZE  = 24           # px, on the 224x224 image\n"
@@ -189,19 +310,19 @@ def build_cells(model_key, cfg):
         "TRIGGER_PATTERN = 'checkerboard' # modular: swap for 'blended'/'wanet' later\n"
         "SEED          = 42\n"
         "SEEDS         = [42, 123, 7]    # multi-seed averaging for the noisy low-rate floor\n"
-        "LOW_RATE_THRESHOLD = 0.001      # rates <= this (only ~3-31 poisoned imgs) run once per seed;\n"
-        "                                # which images get picked matters, so we average. Higher rates\n"
-        "                                # (and rate 0 control) run single-seed with seed 42 only.\n"
+        "LOW_RATE_THRESHOLD = 0.005      # rates <= this are noisy (few poisoned imgs) -> run once per\n"
+        "                                # seed; which images get picked matters, so we average. Higher\n"
+        "                                # rates (and rate 0 control) run single-seed with seed 42 only.\n"
         "\n"
-        f"MODEL_NAME = '{model_key}'\n"
+        f"MODEL_NAME  = '{model_key}'\n"
         f"MODEL_TITLE = '{cfg['title']}'\n"
-        f"BATCH_SIZE = {cfg['batch_size']}\n"
-        f"NUM_EPOCHS = {cfg['num_epochs']}\n"
+        f"DS_TITLE    = '{cfg['ds_title']}'\n"
+        f"DS_SHORT    = '{cfg['ds_short']}'\n"
+        f"CKPT_TAG    = '{cfg['ckpt_tag']}'   # checkpoint/plot name infix ('' for gtsrb, '_bel' for bel)\n"
+        f"BATCH_SIZE  = {cfg['batch_size']}\n"
+        f"NUM_EPOCHS  = {cfg['num_epochs']}\n"
         "\n"
-        "DATA_DIR   = 'dataset'\n"
-        "TRAIN_DIR  = os.path.join(DATA_DIR, 'Train')\n"
-        "TEST_CSV   = os.path.join(DATA_DIR, 'Test.csv')\n"
-        "TEST_DIR   = DATA_DIR\n"
+        + cfg['datavars'] +
         "VAL_SPLIT  = 0.2\n"
         "\n"
         "if torch.cuda.is_available():\n"
@@ -212,6 +333,7 @@ def build_cells(model_key, cfg):
         "    device = torch.device('cpu')\n"
         "\n"
         "print(f'Using device: {device}')\n"
+        "print(f'{MODEL_TITLE} | {DS_TITLE} | classes={NUM_CLASSES} | epochs={NUM_EPOCHS} | batch={BATCH_SIZE}')\n"
         "torch.manual_seed(SEED)\n"
         "np.random.seed(SEED)\n"
         "random.seed(SEED)"
@@ -253,63 +375,33 @@ def build_cells(model_key, cfg):
         "print('Transforms defined (trigger lives in [0,1] pixel space, normalize applied last).')"
     ))
 
-    # ── Datasets (reused: NumericImageFolder + GTSRBTestDataset) ──────────────
-    cells.append(md(
-        "## Datasets — reused `NumericImageFolder` / `GTSRBTestDataset`\n"
-        "Same correct integer label mapping (`'10' -> 10`, matching `Test.csv` ClassId) and same "
-        "80/20 train/val split (seed=42) as the clean training notebooks. The only change: these "
-        "carry the **`[0,1]`-space** transforms (normalize is added later by the wrappers)."
-    ))
+    # ── Datasets ──────────────────────────────────────────────────────────────
+    cells.append(md(cfg['datasets_md']))
     cells.append(code(
-        "class NumericImageFolder(torchvision.datasets.ImageFolder):\n"
-        "    \"\"\"ImageFolder that sorts class folders by integer value, not alphabetically.\n"
-        "    Default alphabetical sort maps folder '10' -> index 2 instead of 10,\n"
-        "    which misaligns with the integer ClassId values in Test.csv.\"\"\"\n"
-        "    def find_classes(self, directory):\n"
-        "        classes = sorted(os.listdir(directory), key=lambda x: int(x))\n"
-        "        class_to_idx = {cls: int(cls) for cls in classes}\n"
-        "        return classes, class_to_idx\n"
-        "\n"
-        "\n"
-        "class GTSRBTestDataset(Dataset):\n"
-        "    def __init__(self, csv_path, root_dir, transform=None):\n"
-        "        self.df = pd.read_csv(csv_path)\n"
-        "        self.root_dir = root_dir\n"
-        "        self.transform = transform\n"
-        "\n"
-        "    def __len__(self):\n"
-        "        return len(self.df)\n"
-        "\n"
-        "    def __getitem__(self, idx):\n"
-        "        row = self.df.iloc[idx]\n"
-        "        img_path = os.path.join(self.root_dir, row['Path'])\n"
-        "        image = Image.open(img_path).convert('RGB')\n"
-        "        label = int(row['ClassId'])\n"
-        "        if self.transform:\n"
-        "            image = self.transform(image)\n"
-        "        return image, label\n"
-        "\n"
-        "\n"
-        "full_train_dataset = NumericImageFolder(TRAIN_DIR, transform=train_transform_01)\n"
-        "assert full_train_dataset.class_to_idx['10'] == 10, 'Label mapping is wrong!'\n"
-        "print(f\"Label mapping check passed: class '10' -> index {full_train_dataset.class_to_idx['10']}\")\n"
-        "\n"
-        "n_total = len(full_train_dataset)\n"
-        "n_val   = int(n_total * VAL_SPLIT)\n"
-        "n_train = n_total - n_val\n"
-        "train_split, val_split = random_split(\n"
-        "    full_train_dataset, [n_train, n_val],\n"
-        "    generator=torch.Generator().manual_seed(SEED)\n"
-        ")\n"
-        "# Val split uses the no-augmentation [0,1] transform (deterministic, like the clean notebook).\n"
-        "val_split.dataset = NumericImageFolder(TRAIN_DIR, transform=val_test_transform_01)\n"
-        "\n"
-        "test_split = GTSRBTestDataset(TEST_CSV, TEST_DIR, transform=val_test_transform_01)\n"
-        "\n"
+        cfg['numeric']
+        + cfg['load']
+        + "\n"
         "print(f'Train: {n_train} | Val: {n_val} | Test: {len(test_split)}')\n"
         "print('NOTE: poison rates are applied to the {} training images (the 80% split that is '\n"
         "      'actually trained on), matching the clean notebooks. The val split stays clean for '\n"
-        "      'honest checkpoint selection.'.format(n_train))"
+        "      'honest checkpoint selection.'.format(n_train))\n"
+        "\n"
+        "# Zero-poison-image guard (BOTH datasets): at the lowest rates round(rate*n_train) can be 0\n"
+        "# (especially on the small bel train set, ~3660 imgs). A rate>0 that poisons 0 images is\n"
+        "# identical to the clean control and would waste seed-runs, so we drop it here. The control\n"
+        "# (rate 0) is always kept. ACTIVE_RATES is what every downstream cell iterates over.\n"
+        "def n_poison_for(rate):\n"
+        "    return int(round(rate * n_train))\n"
+        "\n"
+        "ACTIVE_RATES = []\n"
+        "print(f'\\nPoison-rate plan (n_train={n_train}):')\n"
+        "for r in POISON_RATES:\n"
+        "    npois = n_poison_for(r)\n"
+        "    if r > 0 and npois == 0:\n"
+        "        print(f'  SKIP  p={r*100:.4g}% -> {npois} poisoned imgs (rounds to 0; identical to control)')\n"
+        "        continue\n"
+        "    print(f'  keep  p={r*100:.4g}% -> {npois} poisoned imgs')\n"
+        "    ACTIVE_RATES.append(r)"
     ))
 
     # ── Part 1: apply_trigger ─────────────────────────────────────────────────
@@ -365,7 +457,7 @@ def build_cells(model_key, cfg):
     cells.append(md(
         "## Part 2 — Poisoned training dataset\n"
         "`PoisonedDataset` wraps the clean `[0,1]`-space training split. A fixed random `p`-fraction "
-        "of indices (seed=42) get the trigger stamped **and** are relabeled to `TARGET_LABEL`; the "
+        "of indices (per-run seed) get the trigger stamped **and** are relabeled to `TARGET_LABEL`; the "
         "rest pass through clean. Every sample is ImageNet-normalized last. Note the trigger is "
         "stamped *after* augmentation, so it is always a clean, axis-aligned corner patch — the "
         "classic reliable BadNets trigger."
@@ -387,7 +479,7 @@ def build_cells(model_key, cfg):
         "        self.poison_idx = set(perm[:n_poison].tolist())\n"
         "        self.n_poison = n_poison\n"
         "        if verbose:\n"
-        "            print(f'Poisoned {n_poison} / {n} training images ({poison_rate*100:.1f}%)')\n"
+        "            print(f'Poisoned {n_poison} / {n} training images ({poison_rate*100:.4g}%)')\n"
         "\n"
         "    def __len__(self):\n"
         "        return len(self.base)\n"
@@ -441,14 +533,15 @@ def build_cells(model_key, cfg):
 
     # ── Part 3: training over poison rates ───────────────────────────────────
     cells.append(md(
-        "## Part 3 — Train from scratch for each poison rate\n"
-        "For every rate in `POISON_RATES` we build the poisoned training set, train a fresh model "
-        "for the model's full epoch count (best-clean-val checkpoint saved as "
-        "`badnets_{model}_p{rate}.pth`), and print per-epoch progress.\n"
+        "## Part 3 — Train from scratch for each (poison rate, seed)\n"
+        "For every rate in `ACTIVE_RATES` × its seeds we build the poisoned training set, train a "
+        "fresh model for the model's full epoch count (best-clean-val checkpoint saved as "
+        "`badnets_{model}{CKPT_TAG}_p{rate}_s{seed}.pth`), and print per-epoch progress.\n"
         "\n"
-        "**⚠ Compute-heavy:** this is 5 full trainings (one per rate, including the clean baseline). "
-        "`torch.manual_seed(SEED)` is reset before each rate so model init + data ordering are "
-        "identical across rates — the only thing that changes is the poison fraction."
+        "**⚠ Compute-heavy:** one full training per (rate, seed) — low rates use 3 seeds. "
+        "`torch.manual_seed(seed)` is reset before each run so model init + data ordering depend only "
+        "on the seed. A skip-guard reuses any checkpoint already on disk (incl. older non-seeded "
+        "seed-42 files), so re-running only trains what's missing."
     ))
     cells.append(code(
         "def train_one_rate(poison_rate, seed=SEED):\n"
@@ -463,7 +556,7 @@ def build_cells(model_key, cfg):
         "    optimizer = build_optimizer(model)\n"
         "    scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)\n"
         "    criterion = nn.CrossEntropyLoss()\n"
-        "    ckpt = f'badnets_{MODEL_NAME}_p{poison_rate}_s{seed}.pth'\n"
+        "    ckpt = f'badnets_{MODEL_NAME}{CKPT_TAG}_p{poison_rate}_s{seed}.pth'\n"
         "    best_val_acc = 0.0\n"
         "    for epoch in range(1, NUM_EPOCHS + 1):\n"
         "        model.train()\n"
@@ -511,8 +604,8 @@ def build_cells(model_key, cfg):
         "def resolve_ckpt(rate, seed):\n"
         "    # Prefer the seeded name; for seed 42 fall back to the OLD non-seeded name so\n"
         "    # previously-trained seed-42 checkpoints are reused, not retrained.\n"
-        "    seeded = f'badnets_{MODEL_NAME}_p{rate}_s{seed}.pth'\n"
-        "    old    = f'badnets_{MODEL_NAME}_p{rate}.pth'\n"
+        "    seeded = f'badnets_{MODEL_NAME}{CKPT_TAG}_p{rate}_s{seed}.pth'\n"
+        "    old    = f'badnets_{MODEL_NAME}{CKPT_TAG}_p{rate}.pth'\n"
         "    if os.path.exists(seeded):\n"
         "        return seeded\n"
         "    if seed == SEED and os.path.exists(old):\n"
@@ -520,10 +613,10 @@ def build_cells(model_key, cfg):
         "    return seeded   # not on disk yet -> this is where training will save\n"
         "\n"
         "checkpoints = {}   # (rate, seed) -> checkpoint path\n"
-        "for rate in POISON_RATES:\n"
+        "for rate in ACTIVE_RATES:\n"
         "    for seed in seeds_for(rate):\n"
-        "        seeded = f'badnets_{MODEL_NAME}_p{rate}_s{seed}.pth'\n"
-        "        old    = f'badnets_{MODEL_NAME}_p{rate}.pth'\n"
+        "        seeded = f'badnets_{MODEL_NAME}{CKPT_TAG}_p{rate}_s{seed}.pth'\n"
+        "        old    = f'badnets_{MODEL_NAME}{CKPT_TAG}_p{rate}.pth'\n"
         "        if os.path.exists(seeded):\n"
         "            print(f'\\n===== p={rate*100:.3f}% s{seed} — checkpoint exists, skipping ({seeded}) =====')\n"
         "            checkpoints[(rate, seed)] = seeded\n"
@@ -573,10 +666,10 @@ def build_cells(model_key, cfg):
         "\n"
         "# Reload checkpoints from disk if not in memory (lets eval run without retraining).\n"
         "if 'checkpoints' not in dir():\n"
-        "    checkpoints = {(r, s): resolve_ckpt(r, s) for r in POISON_RATES for s in seeds_for(r)}\n"
+        "    checkpoints = {(r, s): resolve_ckpt(r, s) for r in ACTIVE_RATES for s in seeds_for(r)}\n"
         "\n"
         "results = {}   # rate -> [ {'seed':s, 'clean_acc':ca, 'asr':asr}, ... ]  (1 elem if single-seed)\n"
-        "for rate in POISON_RATES:\n"
+        "for rate in ACTIVE_RATES:\n"
         "    runs = []\n"
         "    for seed in seeds_for(rate):\n"
         "        ca, asr = evaluate_checkpoint(checkpoints[(rate, seed)])\n"
@@ -600,14 +693,14 @@ def build_cells(model_key, cfg):
         "    return f'{rate*100:.3f}'.rstrip('0').rstrip('.') + '%'\n"
         "\n"
         "baseline_ca = mean_ca(0.0)\n"
-        "print(f'{MODEL_TITLE} — BadNets on GTSRB (target class {TARGET_LABEL}, '\n"
+        "print(f'{MODEL_TITLE} — BadNets on {DS_TITLE} (target class {TARGET_LABEL}, '\n"
         "      f'{TRIGGER_SIZE}px {TRIGGER_PATTERN} {TRIGGER_POS} trigger)')\n"
         "print('Low rates (<= {:.4g}) averaged over seeds {}; higher rates single-seed (seed {}).'\n"
         "      .format(LOW_RATE_THRESHOLD, SEEDS, SEED))\n"
         "print()\n"
         "print('Poison Rate  | Clean Acc            | ASR                  | Clean Acc Drop | Seeds')\n"
         "print('-' * 92)\n"
-        "for rate in POISON_RATES:\n"
+        "for rate in ACTIVE_RATES:\n"
         "    n = len(results[rate])\n"
         "    ca_m, ca_s   = mean_ca(rate) * 100,  std_ca(rate) * 100\n"
         "    asr_m, asr_s = mean_asr(rate) * 100, std_asr(rate) * 100\n"
@@ -629,24 +722,24 @@ def build_cells(model_key, cfg):
     cells.append(md(
         "## Part 5 — ASR & Clean Accuracy vs poison rate\n"
         "The story: **ASR rises sharply** with poison rate while **clean accuracy stays flat** "
-        "(the backdoor is stealthy). Saved as `{model}_badnets_sweep.png`."
+        f"(the backdoor is stealthy). Saved as `{model_key}_badnets{cfg['ckpt_tag']}_sweep.png`."
     ))
     cells.append(code(
-        "rates_pct   = [r * 100 for r in POISON_RATES]\n"
-        "ca_pct      = [mean_ca(r) * 100 for r in POISON_RATES]\n"
-        "asr_pct     = [mean_asr(r) * 100 for r in POISON_RATES]\n"
-        "asr_std_pct = [std_asr(r) * 100 for r in POISON_RATES]\n"
+        "rates_pct   = [r * 100 for r in ACTIVE_RATES]\n"
+        "ca_pct      = [mean_ca(r) * 100 for r in ACTIVE_RATES]\n"
+        "asr_pct     = [mean_asr(r) * 100 for r in ACTIVE_RATES]\n"
+        "asr_std_pct = [std_asr(r) * 100 for r in ACTIVE_RATES]\n"
         "\n"
         "fig, ax1 = plt.subplots(figsize=(8, 5))\n"
         "color_asr, color_ca = 'crimson', 'steelblue'\n"
         "ax1.plot(rates_pct, asr_pct, 'o-', color=color_asr, linewidth=2, markersize=7, label='ASR (mean)')\n"
         "# Std error bars only on the multi-seed low rates; single-seed rates are plain points.\n"
-        "_multi = [i for i, r in enumerate(POISON_RATES) if len(results[r]) > 1]\n"
+        "_multi = [i for i, r in enumerate(ACTIVE_RATES) if len(results[r]) > 1]\n"
         "if _multi:\n"
         "    ax1.errorbar([rates_pct[i] for i in _multi], [asr_pct[i] for i in _multi],\n"
         "                 yerr=[asr_std_pct[i] for i in _multi], fmt='none', ecolor=color_asr,\n"
         "                 capsize=4, elinewidth=1.5, label='ASR std (multi-seed)')\n"
-        "ax1.set_xscale('log')   # rates now span 0.01%-20%\n"
+        "ax1.set_xscale('log')   # rates span 0.01%-20%\n"
         "ax1.set_xlabel('Poison rate (%)')\n"
         "ax1.set_ylabel('Attack Success Rate (%)', color=color_asr)\n"
         "ax1.tick_params(axis='y', labelcolor=color_asr)\n"
@@ -663,12 +756,12 @@ def build_cells(model_key, cfg):
         "lines1, labels1 = ax1.get_legend_handles_labels()\n"
         "lines2, labels2 = ax2.get_legend_handles_labels()\n"
         "ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')\n"
-        "plt.title(f'{MODEL_TITLE} — BadNets: ASR vs Clean Accuracy across poison rate (GTSRB)')\n"
+        "plt.title(f'{MODEL_TITLE} — BadNets: ASR vs Clean Accuracy across poison rate ({DS_TITLE})')\n"
         "ax1.grid(True, alpha=0.3)\n"
         "plt.tight_layout()\n"
-        "plt.savefig(f'{MODEL_NAME}_badnets_sweep.png', dpi=150, bbox_inches='tight')\n"
+        "plt.savefig(f'{MODEL_NAME}_badnets{CKPT_TAG}_sweep.png', dpi=150, bbox_inches='tight')\n"
         "plt.show()\n"
-        "print(f'Saved {MODEL_NAME}_badnets_sweep.png')"
+        "print(f'Saved {MODEL_NAME}_badnets{CKPT_TAG}_sweep.png')"
     ))
 
     # ── Part 6: visualization ─────────────────────────────────────────────────
@@ -681,7 +774,7 @@ def build_cells(model_key, cfg):
     ))
     cells.append(code(
         "clean_ckpt    = checkpoints[(0.0, SEED)]         # 0% poison = clean control model\n"
-        "backdoor_rate = max(POISON_RATES)                # strongest backdoor for a clear demo\n"
+        "backdoor_rate = max(ACTIVE_RATES)                # strongest backdoor for a clear demo\n"
         "backdoor_ckpt = checkpoints[(backdoor_rate, SEED)]\n"
         "\n"
         "clean_model = build_model(pretrained=False)\n"
@@ -714,7 +807,7 @@ def build_cells(model_key, cfg):
         "            f'backdoor={bd_pred_on_trig}' + (' (=TARGET!)' if flipped else ''),\n"
         "            fontsize=9, color=('crimson' if flipped else 'black'))\n"
         "        axes[row, 1].axis('off')\n"
-        "plt.suptitle(f'{MODEL_TITLE} — clean vs triggered (backdoor trained at p={backdoor_rate*100:.0f}%)', fontsize=12)\n"
+        "plt.suptitle(f'{MODEL_TITLE} ({DS_TITLE}) — clean vs triggered (backdoor trained at p={backdoor_rate*100:.4g}%)', fontsize=12)\n"
         "plt.tight_layout()\n"
         "plt.show()"
     ))
@@ -794,14 +887,14 @@ def build_cells(model_key, cfg):
     cells.append(md(
         "## Part 8 — Summary headline + JSON dump\n"
         "Minimum poison rate achieving **≥95% ASR** while keeping **clean-accuracy drop < 2 pp**. "
-        "Results saved to `badnets_{model}_gtsrb.json` for later cross-model aggregation."
+        f"Results saved to `badnets_{model_key}_{cfg['ds_short']}.json` for later cross-model aggregation."
     ))
     cells.append(code(
         "ASR_TARGET = 0.95\n"
         "CA_DROP_MAX = 0.02   # 2 pp\n"
         "\n"
         "qualifying = []\n"
-        "for rate in POISON_RATES:\n"
+        "for rate in ACTIVE_RATES:\n"
         "    if rate == 0.0:\n"
         "        continue\n"
         "    if mean_asr(rate) >= ASR_TARGET and (baseline_ca - mean_ca(rate)) < CA_DROP_MAX:\n"
@@ -812,15 +905,15 @@ def build_cells(model_key, cfg):
         "    asr_at = mean_asr(best_rate) * 100\n"
         "    drop_at = (baseline_ca - mean_ca(best_rate)) * 100\n"
         "    headline = (f'BadNets achieves {asr_at:.1f}% mean ASR at just {rate_label(best_rate)} poisoning '\n"
-        "                f'with negligible clean-accuracy cost ({drop_at:+.2f} pp) on {MODEL_TITLE}.')\n"
+        "                f'with negligible clean-accuracy cost ({drop_at:+.2f} pp) on {MODEL_TITLE} ({DS_TITLE}).')\n"
         "else:\n"
         "    best_rate = None\n"
         "    # Report the best mean ASR achieved within the CA-drop budget, else overall best.\n"
-        "    within = [(mean_asr(r), r) for r in POISON_RATES if r != 0.0\n"
+        "    within = [(mean_asr(r), r) for r in ACTIVE_RATES if r != 0.0\n"
         "              and (baseline_ca - mean_ca(r)) < CA_DROP_MAX]\n"
-        "    pool = within if within else [(mean_asr(r), r) for r in POISON_RATES if r != 0.0]\n"
+        "    pool = within if within else [(mean_asr(r), r) for r in ACTIVE_RATES if r != 0.0]\n"
         "    top_asr, top_rate = max(pool)\n"
-        "    headline = (f'No poison rate hit >=95% mean ASR within a <2pp clean-accuracy drop on {MODEL_TITLE}; '\n"
+        "    headline = (f'No poison rate hit >=95% mean ASR within a <2pp clean-accuracy drop on {MODEL_TITLE} ({DS_TITLE}); '\n"
         "                f'best was {top_asr*100:.1f}% mean ASR at {rate_label(top_rate)} poisoning.')\n"
         "\n"
         "print('=' * 80)\n"
@@ -831,29 +924,31 @@ def build_cells(model_key, cfg):
         "\n"
         "out = {\n"
         "    'model': MODEL_NAME,\n"
-        "    'dataset': 'gtsrb',\n"
+        "    'dataset': DS_SHORT,\n"
         "    'attack': 'badnets',\n"
         "    'target_label': TARGET_LABEL,\n"
         "    'trigger': {'size': TRIGGER_SIZE, 'pos': TRIGGER_POS, 'pattern': TRIGGER_PATTERN,\n"
         "                'space': '[0,1] pixel space, applied before normalization'},\n"
         "    'num_epochs': NUM_EPOCHS,\n"
         "    'batch_size': BATCH_SIZE,\n"
+        "    'num_classes': NUM_CLASSES,\n"
         "    'seed': SEED,\n"
         "    'seeds': SEEDS,\n"
         "    'low_rate_threshold': LOW_RATE_THRESHOLD,\n"
-        "    'poison_rates': list(POISON_RATES),\n"
-        "    'runs': {str(r): results[r] for r in POISON_RATES},   # per-seed CA/ASR for every rate\n"
-        "    'clean_acc_mean': [mean_ca(r) for r in POISON_RATES],\n"
-        "    'clean_acc_std':  [std_ca(r) for r in POISON_RATES],\n"
-        "    'asr_mean': [mean_asr(r) for r in POISON_RATES],\n"
-        "    'asr_std':  [std_asr(r) for r in POISON_RATES],\n"
-        "    'clean_acc_drop_mean': [baseline_ca - mean_ca(r) for r in POISON_RATES],\n"
+        "    'poison_rates_grid': list(POISON_RATES),\n"
+        "    'poison_rates': list(ACTIVE_RATES),   # rates actually evaluated (zero-poison rates dropped)\n"
+        "    'runs': {str(r): results[r] for r in ACTIVE_RATES},   # per-seed CA/ASR for every rate\n"
+        "    'clean_acc_mean': [mean_ca(r) for r in ACTIVE_RATES],\n"
+        "    'clean_acc_std':  [std_ca(r) for r in ACTIVE_RATES],\n"
+        "    'asr_mean': [mean_asr(r) for r in ACTIVE_RATES],\n"
+        "    'asr_std':  [std_asr(r) for r in ACTIVE_RATES],\n"
+        "    'clean_acc_drop_mean': [baseline_ca - mean_ca(r) for r in ACTIVE_RATES],\n"
         "    'baseline_clean_acc': baseline_ca,\n"
         "    'min_rate_95asr_2pp': best_rate,\n"
         "    'headline': headline,\n"
         "    'imperceptibility': imperceptibility,\n"
         "}\n"
-        "json_path = f'badnets_{MODEL_NAME}_gtsrb.json'\n"
+        "json_path = f'badnets_{MODEL_NAME}_{DS_SHORT}.json'\n"
         "with open(json_path, 'w') as f:\n"
         "    json.dump(out, f, indent=2)\n"
         "print(f'Saved {json_path}')"
@@ -863,11 +958,12 @@ def build_cells(model_key, cfg):
 
 
 def main():
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gtsrb')
-    for model_key, cfg in CONFIGS.items():
+    base = os.path.dirname(os.path.abspath(__file__))
+    for cfg in CONFIGS:
         global _id
         _id = 0
-        cells = build_cells(model_key, cfg)
+        cells = build_cells(cfg)
+        out_dir = os.path.join(base, cfg['out_subdir'])
         path = os.path.join(out_dir, cfg['nb_name'])
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(nb(cells), f, indent=1)
