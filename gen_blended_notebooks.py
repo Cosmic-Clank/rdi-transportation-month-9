@@ -12,7 +12,8 @@ whole-image blend at opacity alpha) and the experiment structure.
 v1 SCOPE: two INDEPENDENT 1-D sweeps —
   Block A: poison-rate floor at fixed alpha = BLEND_ALPHA (lines up against the BadNets floor)
   Block B: alpha sweep at fixed rate = RATE_FOR_ALPHA_SWEEP (stealth-vs-potency money plot)
-v2 (future): a full 2-D alpha x poison-rate grid (ASR heatmap) — see block_c stub.
+  Block C: focused 2-D alpha x poison-rate grid AROUND THE FLOOR (ASR heatmaps), reusing
+           any checkpoint already on disk (incl. Block B's alpha-row at rate=5%).
 
 Run:  python gen_blended_notebooks.py
 """
@@ -286,7 +287,8 @@ def build_cells(cfg):
         "Block B varies alpha at fixed poison rate. These locate each floor separately but assume the "
         "two axes don't interact. **v2 (future): a full 2-D alpha × poison-rate grid (ASR heatmap)** to "
         "capture interaction and find joint (rate, alpha) operating points — the two 1-D sweeps cannot "
-        "establish joint optima. (See the `block_c_2d_grid_PLACEHOLDER` stub at the end.)"
+        "establish joint optima. **Block C (below)** implements a focused version of this: a small 2-D "
+        "grid over just the floor corner where ASR actually varies."
     ))
 
     # ── Cell 0: config + imports + device ────────────────────────────────────
@@ -959,10 +961,146 @@ def build_cells(cfg):
         "plt.show()"
     ))
 
+    # ══ BLOCK C — focused 2-D floor grid ════════════════════════════════════════
+    cells.append(md(
+        "## Block C — focused 2-D (alpha × poison-rate) grid AROUND THE FLOOR\n"
+        "Blocks A and B are independent 1-D sweeps; Block C is the small 2-D grid over the transition "
+        "**corner** where ASR actually varies. ASR saturates to ~100% above alpha≈0.02 and above "
+        "rate≈0.5%, so that cross-product is already known — this grid deliberately covers only the "
+        "floor. Cells are **seed-averaged in the noisy region** (`rate ≤ LOW_RATE_THRESHOLD` OR "
+        "`alpha ≤ 0.01`) and single-seed elsewhere. Already-trained checkpoints (incl. Block B's "
+        "alpha-row at rate=5%) are **reused, not retrained** — keeping `alpha_train == alpha_test` (v1)."
+    ))
+    cells.append(code(
+        "GRID_ALPHAS = [0.005, 0.01, 0.02, 0.05]\n"
+        "GRID_RATES  = [0.001, 0.0025, 0.005, 0.01, 0.05]\n"
+        "# Rationale: ASR saturates ~100% above alpha=0.02 and above rate~0.5%, so the cross-product\n"
+        "# there is already known. This grid covers the transition CORNER where ASR varies — the floor.\n"
+        "\n"
+        "def seeds_for_grid(alpha, rate):\n"
+        "    # Extend the noisy-region multi-seed rule to BOTH axes: 3 seeds in the marginal region\n"
+        "    # (rate <= LOW_RATE_THRESHOLD OR alpha <= 0.01), single seed (42) in the near-saturated rest.\n"
+        "    return SEEDS if (rate <= LOW_RATE_THRESHOLD or alpha <= 0.01) else [SEED]\n"
+        "\n"
+        "# Dry-run plan: show REUSE vs TRAIN per (alpha, rate, seed) BEFORE spending any GPU.\n"
+        "_n_reuse = _n_train = 0\n"
+        "print('Block C grid plan (REUSE = checkpoint on disk, TRAIN = will train):')\n"
+        "for alpha in GRID_ALPHAS:\n"
+        "    for rate in GRID_RATES:\n"
+        "        for seed in seeds_for_grid(alpha, rate):\n"
+        "            existing = resolve_ckpt(alpha, rate, seed)\n"
+        "            if os.path.exists(existing):\n"
+        "                _n_reuse += 1\n"
+        "                print(f'  REUSE a{alpha} p={rate*100:.4g}% s{seed}  ({existing})')\n"
+        "            else:\n"
+        "                _n_train += 1\n"
+        "                print(f'  TRAIN a{alpha} p={rate*100:.4g}% s{seed}')\n"
+        "_n_runs = sum(len(seeds_for_grid(a, r)) for a in GRID_ALPHAS for r in GRID_RATES)\n"
+        "print(f'\\nBlock C: {len(GRID_ALPHAS)}x{len(GRID_RATES)} grid, {_n_runs} (alpha,rate,seed) runs '\n"
+        "      f'-> {_n_reuse} REUSE, {_n_train} TRAIN. (Review before running the next cell.)')"
+    ))
+    cells.append(code(
+        "# Train-or-reuse every grid cell, then evaluate. alpha_train == alpha_test (v1 convention).\n"
+        "grid_results = {}   # (alpha, rate) -> {asr_mean, asr_std, ca_mean, n_seeds}\n"
+        "_done_reuse = _done_train = 0\n"
+        "for alpha in GRID_ALPHAS:\n"
+        "    for rate in GRID_RATES:\n"
+        "        seeds = seeds_for_grid(alpha, rate)\n"
+        "        asrs, cas = [], []\n"
+        "        for seed in seeds:\n"
+        "            existing = resolve_ckpt(alpha, rate, seed)\n"
+        "            if os.path.exists(existing):\n"
+        "                ck = existing; _done_reuse += 1\n"
+        "            else:\n"
+        "                print(f'  TRAIN a{alpha} p={rate*100:.4g}% s{seed}')\n"
+        "                ck = train_one(rate, alpha, seed); _done_train += 1\n"
+        "            ca, asr = evaluate_checkpoint(ck, alpha)\n"
+        "            asrs.append(asr); cas.append(ca)\n"
+        "        grid_results[(alpha, rate)] = {'asr_mean': float(np.mean(asrs)), 'asr_std': float(np.std(asrs)),\n"
+        "                                       'ca_mean': float(np.mean(cas)), 'n_seeds': len(seeds)}\n"
+        "        g = grid_results[(alpha, rate)]\n"
+        "        print(f'  a{alpha} p={rate*100:.4g}%  ASR={g[\"asr_mean\"]*100:5.1f}% +/- {g[\"asr_std\"]*100:4.1f}  '\n"
+        "              f'CA={g[\"ca_mean\"]*100:5.2f}%  (n_seeds={g[\"n_seeds\"]})')\n"
+        "print(f'\\nBlock C eval done: {_done_reuse} reused, {_done_train} trained.')"
+    ))
+    cells.append(md(
+        "### Block C — ASR floor heatmap\n"
+        "x = poison rate (log), y = alpha (log), color = mean ASR. Each cell annotated with its mean ASR "
+        "(±std for multi-seed cells). Saved as "
+        f"`{model_key}_blended_{cfg['ds_short']}_floor_heatmap.png`."
+    ))
+    cells.append(code(
+        "# ASR heatmap on log-log axes; cells annotated with mean ASR (+/- std if multi-seed).\n"
+        "M = np.array([[grid_results[(a, r)]['asr_mean'] * 100 for r in GRID_RATES] for a in GRID_ALPHAS])\n"
+        "\n"
+        "def _log_edges(vals):\n"
+        "    lv = np.log10(np.array(vals, float))\n"
+        "    mid = (lv[:-1] + lv[1:]) / 2\n"
+        "    return 10 ** np.concatenate([[lv[0] - (mid[0] - lv[0])], mid, [lv[-1] + (lv[-1] - mid[-1])]])\n"
+        "\n"
+        "xe, ye = _log_edges(GRID_RATES), _log_edges(GRID_ALPHAS)\n"
+        "fig, ax = plt.subplots(figsize=(8, 5))\n"
+        "pcm = ax.pcolormesh(xe, ye, M, cmap='viridis', vmin=0, vmax=100, shading='flat')\n"
+        "ax.set_xscale('log'); ax.set_yscale('log')\n"
+        "ax.set_xticks(GRID_RATES); ax.set_xticklabels([f'{r*100:.4g}%' for r in GRID_RATES])\n"
+        "ax.set_yticks(GRID_ALPHAS); ax.set_yticklabels([str(a) for a in GRID_ALPHAS])\n"
+        "ax.minorticks_off()\n"
+        "for a in GRID_ALPHAS:\n"
+        "    for r in GRID_RATES:\n"
+        "        g = grid_results[(a, r)]\n"
+        "        txt = f'{g[\"asr_mean\"]*100:.1f}'\n"
+        "        if g['n_seeds'] > 1: txt += f'\\n±{g[\"asr_std\"]*100:.1f}'\n"
+        "        ax.text(r, a, txt, ha='center', va='center', fontsize=7,\n"
+        "                color=('white' if g['asr_mean']*100 < 55 else 'black'))\n"
+        "ax.set_xlabel('Poison rate (log)'); ax.set_ylabel('Blend alpha (log)')\n"
+        "fig.colorbar(pcm, ax=ax, label='Mean ASR (%)')\n"
+        "plt.title(f'Blended ASR floor — alpha x poison-rate ({MODEL_TITLE}/{DS_TITLE}, saturated 5%+ region excluded)')\n"
+        "plt.tight_layout()\n"
+        "plt.savefig(f'{MODEL_NAME}_blended_{DS_SHORT}_floor_heatmap.png', dpi=150, bbox_inches='tight')\n"
+        "plt.show()\n"
+        "print(f'Saved {MODEL_NAME}_blended_{DS_SHORT}_floor_heatmap.png')"
+    ))
+    cells.append(md(
+        "### Block C — stealthy-AND-potent heatmap\n"
+        "Same mean-ASR color, but cells whose trigger is **imperceptible (SSIM > 0.95)** are circled. "
+        "SSIM depends only on alpha (constant down each alpha row), computed via the existing "
+        "`perceptual_at_alpha`. The circled high-ASR cells are the region that is simultaneously "
+        f"imperceptible and reliable. Saved as `{model_key}_blended_{cfg['ds_short']}_floor_stealth_heatmap.png`."
+    ))
+    cells.append(code(
+        "# SSIM depends only on alpha -> compute once per alpha row (reuse perceptual_at_alpha).\n"
+        "ssim_by_alpha = {a: perceptual_at_alpha(a)[1] for a in GRID_ALPHAS}\n"
+        "print('SSIM by alpha (constant across rate):', {a: round(s, 4) for a, s in ssim_by_alpha.items()})\n"
+        "\n"
+        "fig, ax = plt.subplots(figsize=(8, 5))\n"
+        "pcm = ax.pcolormesh(xe, ye, M, cmap='viridis', vmin=0, vmax=100, shading='flat')\n"
+        "ax.set_xscale('log'); ax.set_yscale('log')\n"
+        "ax.set_xticks(GRID_RATES); ax.set_xticklabels([f'{r*100:.4g}%' for r in GRID_RATES])\n"
+        "ax.set_yticks(GRID_ALPHAS); ax.set_yticklabels([str(a) for a in GRID_ALPHAS])\n"
+        "ax.minorticks_off()\n"
+        "_stealthy = [(a, r) for a in GRID_ALPHAS for r in GRID_RATES if ssim_by_alpha[a] > 0.95]\n"
+        "if _stealthy:\n"
+        "    ax.scatter([r for a, r in _stealthy], [a for a, r in _stealthy], s=430, marker='o',\n"
+        "               facecolors='none', edgecolors='white', linewidths=2.0, label='SSIM>0.95 (imperceptible)')\n"
+        "    ax.legend(loc='upper left', fontsize=8)\n"
+        "for a in GRID_ALPHAS:\n"
+        "    for r in GRID_RATES:\n"
+        "        g = grid_results[(a, r)]\n"
+        "        ax.text(r, a, f'{g[\"asr_mean\"]*100:.0f}', ha='center', va='center', fontsize=7,\n"
+        "                color=('white' if g['asr_mean']*100 < 55 else 'black'))\n"
+        "ax.set_xlabel('Poison rate (log)'); ax.set_ylabel('Blend alpha (log)')\n"
+        "fig.colorbar(pcm, ax=ax, label='Mean ASR (%)')\n"
+        "plt.title(f'Blended: stealthy-AND-potent floor ({MODEL_TITLE}/{DS_TITLE}; circled = SSIM>0.95)')\n"
+        "plt.tight_layout()\n"
+        "plt.savefig(f'{MODEL_NAME}_blended_{DS_SHORT}_floor_stealth_heatmap.png', dpi=150, bbox_inches='tight')\n"
+        "plt.show()\n"
+        "print(f'Saved {MODEL_NAME}_blended_{DS_SHORT}_floor_stealth_heatmap.png')"
+    ))
+
     # ── Part 8: summary + JSON ──────────────────────────────────────────────────
     cells.append(md(
         "## Part 8 — Summary + JSON dump\n"
-        f"Dumps BOTH Block A (rate sweep) and Block B (alpha sweep) plus full config to "
+        f"Dumps Block A (rate sweep), Block B (alpha sweep) and Block C (floor grid) plus full config to "
         f"`blended_{model_key}_{cfg['ds_short']}.json` for cross-model aggregation."
     ))
     cells.append(code(
@@ -1013,27 +1151,17 @@ def build_cells(cfg):
         "        'alpha_results': {str(a): alpha_results[a] for a in BLEND_ALPHAS},\n"
         "        'min_alpha_95asr': min_alpha_95,\n"
         "    },\n"
+        "    # ── Block C: focused 2-D floor grid (None if Block C cells weren't run) ──\n"
+        "    'block_c': ({\n"
+        "        'grid_alphas': GRID_ALPHAS, 'grid_rates': GRID_RATES,\n"
+        "        'seeding_rule': 'multi-seed if rate<=LOW_RATE_THRESHOLD or alpha<=0.01, else seed 42',\n"
+        "        'grid_results': {f'a{a}_p{r}': grid_results[(a, r)] for a in GRID_ALPHAS for r in GRID_RATES},\n"
+        "    } if 'grid_results' in dir() else None),\n"
         "}\n"
         "json_path = f'blended_{MODEL_NAME}_{DS_SHORT}.json'\n"
         "with open(json_path, 'w') as f:\n"
         "    json.dump(out, f, indent=2)\n"
         "print(f'Saved {json_path}')"
-    ))
-
-    # ── v2 extension stub ───────────────────────────────────────────────────────
-    cells.append(md(
-        "## v2 extension point — 2-D alpha × poison-rate grid (NOT implemented)\n"
-        "The two 1-D sweeps above cannot establish *joint* (rate, alpha) optima. v2 replaces them with a "
-        "full 2-D grid → an ASR heatmap. Stub left below to mark the extension point."
-    ))
-    cells.append(code(
-        "def block_c_2d_grid_PLACEHOLDER():\n"
-        "    pass\n"
-        "# v2 EXTENSION POINT (do not implement in v1): replace the two independent 1-D sweeps with a\n"
-        "# full 2-D grid over (alpha in BLEND_ALPHAS) x (poison_rate in ACTIVE_RATES). For each\n"
-        "# (alpha, rate) cell, train-or-reuse a checkpoint via train_one(rate, alpha, SEED) and record\n"
-        "# ASR -> a 2-D ASR heatmap (rows=alpha, cols=rate). This captures the alpha x rate INTERACTION\n"
-        "# and locates joint operating points that the two 1-D sweeps (Block A, Block B) cannot."
     ))
 
     return cells
