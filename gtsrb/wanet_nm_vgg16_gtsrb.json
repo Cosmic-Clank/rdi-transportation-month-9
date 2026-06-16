@@ -1,0 +1,124 @@
+{
+  "model": "vgg16",
+  "dataset": "gtsrb",
+  "attack": "wanet_noise_mode",
+  "reference": "Nguyen & Tran 2021, ICLR (WaNet: Imperceptible Warping-based Backdoor Attack)",
+  "warp_ported_from": "VinAIResearch/Warping-based_Backdoor_Attack-release (train.py)",
+  "target_label": 0,
+  "trigger": {
+    "type": "wanet warp (grid_sample)",
+    "warp_seed": 1234,
+    "warp_k": 4,
+    "img_size": 224,
+    "grid_rescale": 1,
+    "grid_sample": "align_corners=True, bilinear, zeros-pad (authors settings)",
+    "space": "[0,1] pixel space, applied before normalization",
+    "s_train_eq_s_test": true
+  },
+  "noise_mode": {
+    "enabled": true,
+    "pc_attack": 0.1,
+    "cross_ratio": 2.0,
+    "application": "per-batch in training loop (authors train.py 70-89); whole batch",
+    "no_dataset_poison_rate": "WaNet poisons per batch; no POISON_RATES sweep (native config)."
+  },
+  "num_epochs": 20,
+  "batch_size": 32,
+  "num_classes": 43,
+  "seed": 42,
+  "seeds": [
+    42,
+    123,
+    7
+  ],
+  "warp_s": 5,
+  "warp_s_grid": [
+    2,
+    5,
+    10,
+    20,
+    40
+  ],
+  "native_config": {
+    "s": 5,
+    "pc_attack": 0.1,
+    "cross_ratio": 2.0,
+    "runs": [
+      {
+        "seed": 42,
+        "clean_acc": 0.9466349960411719,
+        "asr": 0.0903739061256961
+      },
+      {
+        "seed": 123,
+        "clean_acc": 0.9501979414093429,
+        "asr": 0.5340493237867939
+      },
+      {
+        "seed": 7,
+        "clean_acc": 0.9549485352335708,
+        "asr": 0.6638027048528242
+      }
+    ],
+    "clean_acc_mean": 0.9505938242280285,
+    "clean_acc_std": 0.0034055127739677496,
+    "asr_mean": 0.4294086449217714,
+    "asr_std": 0.24551632743724516,
+    "headline": "WaNet noise mode (s=5, pc=0.1) on VGG-16 (GTSRB): CA 95.06+/-0.34% | ASR 42.94+/-24.55%  (seeds [42, 123, 7])"
+  },
+  "block_b": {
+    "pc_attack": 0.1,
+    "cross_ratio": 2.0,
+    "strength_results": {
+      "2": {
+        "clean_acc": 0.9011084718923199,
+        "asr": 0.10421638822593476,
+        "psnr": 39.30661983206026,
+        "ssim": 0.9816990494728088,
+        "lpips": 0.007343559470260516,
+        "disp_px": 1.0277410745620728
+      },
+      "5": {
+        "clean_acc": 0.9466349960411719,
+        "asr": 0.0903739061256961,
+        "psnr": 31.980758508537253,
+        "ssim": 0.9271136522293091,
+        "lpips": 0.02623175317235291,
+        "disp_px": 2.5533688068389893
+      },
+      "10": {
+        "clean_acc": 0.9651623119556612,
+        "asr": 0.93969769291965,
+        "psnr": 26.873849190093903,
+        "ssim": 0.8386550545692444,
+        "lpips": 0.06896977880038321,
+        "disp_px": 5.057862758636475
+      },
+      "20": {
+        "clean_acc": 0.9732383214568487,
+        "asr": 0.913206046141607,
+        "psnr": 22.53403739480349,
+        "ssim": 0.7206093072891235,
+        "lpips": 0.17390455012768508,
+        "disp_px": 9.951321601867676
+      },
+      "40": {
+        "clean_acc": 0.9782264449722882,
+        "asr": 0.9941129673826571,
+        "psnr": 19.39067739649736,
+        "ssim": 0.624586820602417,
+        "lpips": 0.3415848702788353,
+        "disp_px": 19.403352737426758
+      }
+    },
+    "displacement_px": {
+      "2": 1.0277410745620728,
+      "5": 2.5533688068389893,
+      "10": 5.057862758636475,
+      "20": 9.951321601867676,
+      "40": 19.403352737426758
+    },
+    "min_s_95asr": 40
+  },
+  "block_c": "stub (not implemented in v1; see block_c_2d_grid_PLACEHOLDER)"
+}
