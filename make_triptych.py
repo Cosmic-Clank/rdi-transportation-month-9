@@ -232,8 +232,16 @@ print(f'ε (normalized space): {eps:.6f}')
 # ────────────────────────────────────────────────────────────────
 # VISUALIZATION: THREE PANELS
 # ────────────────────────────────────────────────────────────────
-# Amplify perturbation for visibility: clip(0.5 + 20*delta, 0, 1)
-delta_amplified = torch.clamp(0.5 + 20 * delta, 0, 1)
+# Visualize perturbation: use absolute magnitude normalized within image
+# Since ε is tiny (0.002), we normalize per-pixel magnitude to [0,1] for visibility
+delta_mag = torch.sqrt((delta ** 2).sum(dim=1, keepdim=True)).clamp(1e-8)  # magnitude per pixel
+max_mag = delta_mag.max().item()
+min_mag = delta_mag.min().item()
+print(f'Perturbation magnitude: min={min_mag:.6f}, max={max_mag:.6f}')
+
+# Normalize magnitude to [0,1] within the image (shows spatial pattern of attack)
+delta_vis = (delta_mag - min_mag) / (max_mag - min_mag + 1e-8)
+delta_vis = delta_vis.repeat(1, 3, 1, 1)  # replicate to RGB
 
 fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
@@ -249,13 +257,13 @@ ax.imshow(x_adv_01.squeeze(0).permute(1, 2, 0).cpu().numpy())
 ax.set_title(f'Adversarial (ε={eps:.4f})\nPred: {adv_pred}', fontsize=11, fontweight='bold')
 ax.axis('off')
 
-# Panel 3: Amplified Perturbation
+# Panel 3: Amplified Perturbation (grayscale magnitude)
 ax = axes[2]
-ax.imshow(delta_amplified.squeeze(0).permute(1, 2, 0).cpu().numpy())
-ax.set_title(f'Perturbation (amplified ×20)\nSSIM: {ssim_val:.4f}', fontsize=11, fontweight='bold')
+ax.imshow(delta_vis.squeeze(0).permute(1, 2, 0).cpu().numpy(), cmap='hot')
+ax.set_title(f'Perturbation magnitude\n(normalized spatial pattern)\nSSIM: {ssim_val:.6f}', fontsize=11, fontweight='bold')
 ax.axis('off')
 
-plt.suptitle(f'Classification Evasion Triptych — ResNet-50 on GTSRB (PGD, {PGD_STEPS} steps)', 
+plt.suptitle(f'Classification Evasion — ResNet-50 on GTSRB (PGD, {PGD_STEPS} steps, ε={eps:.4f}, SSIM={ssim_val:.6f})', 
              fontsize=13, fontweight='bold', y=1.02)
 plt.tight_layout()
 
