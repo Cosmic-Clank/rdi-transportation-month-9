@@ -67,6 +67,9 @@ def main():
                     help="pixel-space L-inf budgets k/255 to try; the smallest that "
                          "flips the prediction is used")
     ap.add_argument("--steps", type=int, default=20)
+    ap.add_argument("--amp", type=float, default=0.0,
+                    help="perturbation panel: 0 = contrast-normalise (default, most visible); "
+                         ">0 = fixed magnification, e.g. 10 (fainter at tiny eps)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="figs/evasion_triptych.png")
     args = ap.parse_args()
@@ -169,7 +172,12 @@ def main():
     xn = x[0].permute(1, 2, 0).cpu().numpy()
     an = adv[0].permute(1, 2, 0).cpu().numpy()
     delta = an - xn
-    dvis = (delta - delta.min()) / (delta.max() - delta.min() + 1e-12)   # contrast-normalised
+    if args.amp > 0:
+        dvis = np.clip(0.5 + args.amp * delta, 0, 1)          # fixed magnification
+        ptitle = f"Perturbation\n(×{args.amp:g})"
+    else:
+        dvis = (delta - delta.min()) / (delta.max() - delta.min() + 1e-12)  # contrast-normalised
+        ptitle = "Perturbation\n(amplified)"
     ssim = ssim_fn(xn, an, channel_axis=2, data_range=1.0) if ssim_fn else float("nan")
     print(f"row={chosen['idx']} gt={GTSRB_NAMES[chosen['gt']]!r} | "
           f"clean={GTSRB_NAMES[cc]!r} ({cconf:.2f}) -> adv={GTSRB_NAMES[ac]!r} ({aconf:.2f}) | "
@@ -182,7 +190,7 @@ def main():
         a.set_xticks([]); a.set_yticks([])
     ax[0].imshow(np.clip(xn, 0, 1)); ax[0].set_title(f"Clean\n{GTSRB_NAMES[cc]} ({cconf:.2f})", fontsize=10)
     ax[1].imshow(np.clip(an, 0, 1)); ax[1].set_title(f"Adversarial (ε={eps*255:.0f}/255)\n{GTSRB_NAMES[ac]} ({aconf:.2f})", fontsize=10)
-    ax[2].imshow(dvis); ax[2].set_title("Perturbation\n(contrast-normalised)", fontsize=10)
+    ax[2].imshow(dvis); ax[2].set_title(ptitle, fontsize=10)
     fig.suptitle(f"Imperceptible evasion  (SSIM {ssim:.3f})", fontsize=11, y=1.02)
     fig.tight_layout()
     fig.savefig(args.out, dpi=300, bbox_inches="tight")
